@@ -78,7 +78,14 @@ Write-Host ''
 if ($LASTEXITCODE -ne 0) { throw "yt-dlp failed with exit code $LASTEXITCODE" }
 
 $latest = Get-ChildItem $saveDir -Filter '*.wav' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-if ($latest) { Write-Host "Saved: $($latest.FullName)" }
+if ($latest) {
+    $renamed = Rename-ElectoneAudioFile -Path $latest.FullName
+    if ($renamed -ne $latest.FullName) {
+        Write-Host "Renamed: $([System.IO.Path]::GetFileName($renamed))"
+    }
+    Write-Host "Saved: $renamed"
+    $latest = Get-Item -LiteralPath $renamed
+}
 
 if ($latest -and -not $NoSeparate) {
     Write-Host ''

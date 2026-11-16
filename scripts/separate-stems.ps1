@@ -10,7 +10,6 @@
 
 $root = $script:ElectoneRepoRoot
 $inferExe = Join-Path $root '.venv\Scripts\bs-roformer-infer.exe'
-$ffmpeg = Join-Path $root 'tools\ffmpeg.exe'
 
 if (-not (Test-Path $inferExe)) {
     throw 'bs-roformer-infer is not installed. Run scripts\setup-env.ps1 first.'
@@ -20,12 +19,14 @@ $ws = Get-ElectoneWorkspace -Override $Workspace
 
 if (-not $AudioFile) {
     $AudioFile = Get-ChildItem (Join-Path $ws 'audio') -Filter '*.wav' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
     if (-not $AudioFile) { throw "No wav file found in $(Join-Path $ws 'audio')." }
 } else {
     $AudioFile = Resolve-ElectonePath $AudioFile
 }
 if (-not (Test-Path $AudioFile)) { throw "Audio file not found: $AudioFile" }
+
+$AudioFile = Rename-ElectoneAudioFile -Path $AudioFile
 
 $name = [System.IO.Path]::GetFileNameWithoutExtension($AudioFile)
 $outDir = Join-Path $ws "stems\$name"
@@ -54,9 +55,9 @@ if ($code -ne 0) { throw "bs-roformer-infer failed with exit code $code" }
 
 foreach ($file in Get-ChildItem $outDir -Filter '*.wav') {
     $stem = $null
-    if ($file.BaseName -match '\(([A-Za-z]+)\)') {
+    if ($file.BaseName -match '_(vocals|drums|bass|guitar|piano|other|instrumental)$') {
         $stem = $Matches[1].ToLower()
-    } elseif ($file.BaseName -match '_(vocals|drums|bass|guitar|piano|other|instrumental)$') {
+    } elseif ($file.BaseName -match '\(([A-Za-z]+)\)$') {
         $stem = $Matches[1].ToLower()
     }
     if ($stem -and $file.BaseName -ne $stem) {
@@ -64,20 +65,12 @@ foreach ($file in Get-ChildItem $outDir -Filter '*.wav') {
     }
 }
 
-function Get-StemVolume {
-    param([string]$Path)
-    $output = & $ffmpeg -hide_banner -i $Path -af volumedetect -f null - 2>&1
-    $mean = [regex]::Match(($output | Out-String), 'mean_volume:\s*(-?[\d.]+) dB').Groups[1].Value
-    $max = [regex]::Match(($output | Out-String), 'max_volume:\s*(-?[\d.]+) dB').Groups[1].Value
-    return [pscustomobject]@{ Mean = [double]$mean; Max = [double]$max }
-}
+$python = Join-Path $root '.venv\Scripts\python.exe'
+$checker = Join-Path $PSScriptRoot 'check-stems.py'
 
-Write-Host '分离完成，质量检查（mean = 平均电平，peak = 峰值）：'
-$anyQuiet = $false
-foreach ($file in Get-ChildItem $outDir -Filter '*.wav' | Sort-Object Name) {
-    $vol = Get-StemVolume -Path $file.FullName
-    $flag = ''
-    if ($vol.Mean -lt -50) { $flag = '  <-- 接近无声（可能本曲没有这个声部）'; $anyQuiet = $true }
-    Write-Host ("  {0,-16} mean {1,6:N1} dB   peak {2,6:N1} dB{3}" -f $file.Name, $vol.Mean, $vol.Max, $flag)
+Write-Host ''
+if ((Test-Path $python) -and (Test-Path $checker)) {
+    & $python $checker --stems $outDir --mix $AudioFile
+} else {
+    Write-Host '提示：未找到检查脚本或 Python，跳过质量检查。'
 }
-if ($anyQuiet) { Write-Host '提示：接近无声的轨道通常代表该乐器没有出现在原曲中，不是分离失败。' }

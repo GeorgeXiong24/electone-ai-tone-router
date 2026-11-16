@@ -31,6 +31,85 @@ function Get-ElectoneWorkspace {
     return (Join-Path $script:ElectoneRepoRoot 'workspace')
 }
 
+function Get-ElectonePrimaryName {
+    param([string]$Text)
+
+    $t = $Text.Trim()
+    if (-not $t) { return '' }
+
+    $cjk = [regex]::Match($t, '[\u4e00-\u9fff\u3400-\u4dbf]+')
+    if ($cjk.Success) { return $cjk.Value }
+
+    $t = $t -replace '\s*[\(\[（【].*$', ''
+    return $t.Trim()
+}
+
+function Get-ElectoneTrackName {
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [int]$MaxLength = 80
+    )
+
+    $t = $Title.Trim()
+    $artist = ''
+    $song = ''
+
+    $segments = @($t -split '\s+-\s+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($segments.Count -ge 2) {
+        $artist = Get-ElectonePrimaryName $segments[0]
+        $song = Get-ElectonePrimaryName ($segments[1] -replace '\s*[\(\[（【].*$', '')
+    } else {
+        $bracket = [regex]::Match($t, '[【\[（]([^】\]）]+)[】\]）]')
+        if ($bracket.Success) {
+            $prefix = $t.Substring(0, $bracket.Index)
+            if (-not [string]::IsNullOrWhiteSpace($prefix)) {
+                $artist = Get-ElectonePrimaryName $prefix
+            }
+            $song = Get-ElectonePrimaryName $bracket.Groups[1].Value
+        } else {
+            $song = Get-ElectonePrimaryName $t
+        }
+    }
+
+    if ($artist -and $song -and $artist -ne $song) {
+        $name = "$artist - $song"
+    } elseif ($song) {
+        $name = $song
+    } else {
+        $name = $artist
+    }
+
+    $name = $name -replace '[<>:"/\\|?*]', ''
+    $name = ($name -replace '\s+', ' ').Trim().TrimEnd('.')
+    if ($name.Length -gt $MaxLength) {
+        $name = $name.Substring(0, $MaxLength).Trim().TrimEnd('.')
+    }
+    return $name
+}
+
+function Rename-ElectoneAudioFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $file = Get-Item -LiteralPath $Path
+    $clean = Get-ElectoneTrackName -Title $file.BaseName
+    if (-not $clean -or $clean -eq $file.BaseName) { return $file.FullName }
+
+    $target = Join-Path $file.DirectoryName "$clean$($file.Extension)"
+    $i = 2
+    while ((Test-Path -LiteralPath $target) -and
+           -not [string]::Equals($target, $file.FullName, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $target = Join-Path $file.DirectoryName "$clean ($i)$($file.Extension)"
+        $i++
+    }
+
+    if ([string]::Equals($target, $file.FullName, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $file.FullName
+    }
+
+    Move-Item -LiteralPath $file.FullName -Destination $target -Force
+    return $target
+}
+
 function Save-ElectoneWorkspace {
     param([Parameter(Mandatory = $true)][string]$Path)
 
