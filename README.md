@@ -16,8 +16,8 @@ Cantabile, one timbre per keyboard (Upper / Lower / Pedal).
 | Separation failure detection | Done |
 | Second-stage refinement (drums → 6 pieces) | Done |
 | Live progress reporting | Done |
-| Melody / chord / counter-melody analysis | Planned |
-| Instrument → VST timbre mapping (sforzando / Surge XT / Decent Sampler) | Planned |
+| Melody / chord / counter-melody analysis | Done |
+| Instrument → VST timbre mapping (sforzando / Surge XT / Decent Sampler) | Done |
 | Cantabile rack generation for ELB-02 | Planned |
 
 ## How it works
@@ -194,6 +194,43 @@ Runs from the separation script against the **raw** model output, before any pru
 stems cannot trip the `dumped` detector. See [Separation caveats](#separation-caveats) for what
 these numbers mean.
 
+### Tone analysis & generation
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\analyze-tones.py --song 不能說的祕密
+.\.venv\Scripts\python.exe .\scripts\build-tones.py  --song 不能說的祕密
+```
+
+- `analyze-tones.py` identifies each stem's instrument, timbre traits (brightness, register,
+  harmonicity, polyphony) and musical role (melody / counter-melody / chords / accompaniment /
+  pad / bass line / rhythm) on 5-second windows. Writes `workspace\analysis\<song>\analysis.json`
+  plus a readable `analysis.md`.
+- `build-tones.py` turns the analysis into **single-instrument** tone files under
+  `workspace\tone\<右手|左手|脚>\<plugin>\` — one file never mixes instruments. Right hand gets the
+  melody, left hand gets chords/counter-melody/accompaniment, the pedal gets the bass line;
+  drums produce no tone file (the ELB-02 rhythm section covers them).
+- Piano uses a sample-based source (sforzando + Accurate-Salamander grand piano SFZ); the SFZ
+  config lives in the project and references the sample library by absolute path.
+- Surge tones are written as `.fxp` — Surge XT's native patch format, loadable by
+  **dragging it onto the Surge XT window** (Surge's drop whitelist includes `.fxp`).
+  Add `--vstpreset` to also write a `.vstpreset` for VST3 hosts (Cantabile); that one is
+  loaded by the host's own preset mechanism and is not a Surge drop format.
+- **For a tone that actually sounds like the recording, use the sampled instruments.**
+  Surge XT is a synthesizer with no sample playback, so factory presets cannot reproduce
+  the real voice/guitar/bass/string timbres. `build-sample-tones.py` cuts real single notes
+  out of each stem and builds a sforzando `.sfz` + its own `.wav` samples (one instrument
+  per `.sfz` and sample folder):
+
+  ```powershell
+  .\.venv\Scripts\python.exe .\scripts\build-sample-tones.py --latest
+  ```
+
+  Output goes to `workspace\tone\<右手|左手|脚>\sforzando\`, with note counts and pitch ranges
+  in `tone\sample-instruments.json`. The piano keeps the Salamander grand-piano library
+  instead of sliced stem notes.
+- Nothing is ever written into a plugin's default/user patch folder — the scripts refuse
+  to write outside `workspace\tone\`. A `manifest.json` in that folder records what was produced.
+
 ### Workspace
 
 All stages share one workspace root, resolved in this order:
@@ -255,6 +292,9 @@ automatically). Prefer the 6-stem model plus refinement.
 | `separate-stems.ps1` | 6-stem separation, then quality check |
 | `check-stems.py` | per-window failure detection, per-stem usability |
 | `refine-stems.py` | specialist second-stage split (drums → 6 pieces) |
+| `analyze-tones.py` | per-stem instrument/timbre/role analysis → JSON + MD report |
+| `build-tones.py` | single-instrument Surge XT tones (`.fxp`, optional `--vstpreset`) |
+| `build-sample-tones.py` | cut single notes from each stem → sforzando SFZ instrument (`.sfz` + `.wav`) |
 | `prune-stems.py` | keep the N loudest stems, fold the rest into `other` |
 | `progress.py` | stage headers, live percentage, heartbeat, failure reporting |
 | `align-model-config.py` | repair a model whose `chunk_size` breaks the chunker |
@@ -263,8 +303,6 @@ automatically). Prefer the 6-stem model plus refinement.
 
 ## Roadmap
 
-- Melody / chord / counter-melody role detection from stems
-- Instrument → VST timbre mapping table (SFZ libraries, Surge XT presets)
 - Automatic Cantabile rack/song generation (Performer triggers / Network Server)
 - Live MIDI routing ELB-02 (Upper/Lower/Pedal) → Cantabile
 - Fallback for segments where separation fails (currently reported, not repaired)

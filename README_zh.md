@@ -15,8 +15,8 @@
 | 分离失效检测 | 已完成 |
 | 二级细分（鼓 → 6 个部件） | 已完成 |
 | 实时进度显示 | 已完成 |
-| 主旋律 / 和弦 / 副旋律分析 | 规划中 |
-| 乐器 → VST 音色映射（sforzando / Surge XT / Decent Sampler） | 规划中 |
+| 主旋律 / 和弦 / 副旋律分析 | 已完成 |
+| 乐器 → VST 音色映射（sforzando / Surge XT / Decent Sampler） | 已完成 |
 | 生成 Cantabile（ELB-02）配置 | 规划中 |
 
 ## 实现原理
@@ -177,6 +177,39 @@
 检测在分离脚本里针对**模型的原始输出**运行，早于任何剪枝，
 这样被折叠的轨不会让 `dumped` 检测误报。各指标的含义见[分离的局限](#分离的局限)。
 
+### 音色分析与生成
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\analyze-tones.py --song 不能說的祕密
+.\.venv\Scripts\python.exe .\scripts\build-tones.py  --song 不能說的祕密
+```
+
+- `analyze-tones.py` 逐轨识别乐器、音色特点（亮度、音区、谐波、同时音数）并按 5 秒窗口
+  判定音乐角色（主旋律 / 副旋律 / 和弦 / 伴奏 / 和声铺底 / 低音线条 / 节奏）。
+  输出 `workspace\analysis\<歌曲>\analysis.json` 和可读的 `analysis.md`。
+- `build-tones.py` 把分析结果生成**单乐器**音色文件，写到
+  `workspace\tone\<右手|左手|脚>\<插件>\`——一个文件绝不混合多个乐器。
+  右手 = 主旋律，左手 = 副旋律/和弦/伴奏，脚 = 低音线条；鼓组不生成音色文件
+  （节奏由 ELB-02 自带 rhythm 处理）。
+- 钢琴走采样音源（sforzando + Accurate-Salamander 大钢琴 SFZ）：SFZ 配置放在项目里，
+  以绝对路径引用采样库。
+- Surge 音色默认生成为 `.fxp` —— Surge 原生补丁格式，**拖进 Surge XT 窗口即可加载**
+  （Surge 的拖放白名单包含 `.fxp`）。
+  需要给 VST3 宿主（Cantabile）用时加 `--vstpreset`，会额外生成 `.vstpreset`；
+  它只能由宿主自己的预设机制加载，不是 Surge 的拖放格式。
+- **要"像原曲"，用采样音色**：Surge XT 是合成器、没有采样播放，工厂预设无法复现
+  人声/吉他/贝斯/弦乐的真实音色。`build-sample-tones.py` 从每条 stem 里切出真实单音，
+  生成 sforzando 的 `.sfz` + 对应 `.wav` 样本（每个 `.sfz` 及其 `samples/` 目录只含一件乐器）：
+
+  ```powershell
+  .\.venv\Scripts\python.exe .\scripts\build-sample-tones.py --latest
+  ```
+
+  输出到 `workspace\tone\<右手|左手|脚>\sforzando\`，并在 `tone\sample-instruments.json`
+  记录每个音色的音符数与音域。钢琴不使用轨道切片，仍用 Salamander 大钢琴采样库。
+- **绝不写入任何插件的默认/用户音色目录**——脚本会拒绝写到
+  `workspace\tone\` 之外。`tone\manifest.json` 记录每次生成的文件清单和加载方式。
+
 ### 工作区
 
 所有步骤共用一个工作区根目录，优先级：
@@ -233,6 +266,9 @@
 | `separate-stems.ps1` | 6 轨分离，随后质量检测 |
 | `check-stems.py` | 逐窗口失效检测、每轨可用率 |
 | `refine-stems.py` | 专用二级细分（鼓 → 6 个部件） |
+| `analyze-tones.py` | 逐轨乐器/音色特点/角色分析 → JSON + MD 报告 |
+| `build-tones.py` | 生成 Surge XT 单乐器音色（`.fxp`；`--vstpreset` 可选） |
+| `build-sample-tones.py` | 从每条 stem 提取单音，生成 sforzando 采样音色（`.sfz` + `.wav`） |
 | `prune-stems.py` | 保留最响的 N 轨，其余折进 `other` |
 | `progress.py` | 阶段标头、实时百分比、心跳、失败报告 |
 | `align-model-config.py` | 修复 `chunk_size` 会导致分块器崩溃的模型配置 |
@@ -241,8 +277,6 @@
 
 ## 后续计划
 
-- 从分离轨判定主旋律 / 和弦 / 副旋律角色
-- 乐器 → VST 音色映射表（SFZ 采样库、Surge XT 预设）
 - 自动生成 Cantabile 的 rack/song 配置（Performer triggers / Network Server）
 - ELB-02（右手/左手/脚）→ Cantabile 的实时 MIDI 路由
 - 分离失效段落的兜底方案（目前只报告，不修复）
