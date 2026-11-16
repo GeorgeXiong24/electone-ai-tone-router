@@ -1,1 +1,4 @@
 .commandcode/
+tools/*.exe
+workspace/
+config.json
