@@ -3,7 +3,8 @@
     [string]$Song,
     [string]$Workspace,
     [string]$OutDir,
-    [string]$CookiesFromBrowser
+    [string]$CookiesFromBrowser,
+    [switch]$NoSeparate
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -78,3 +79,8 @@ if ($LASTEXITCODE -ne 0) { throw "yt-dlp failed with exit code $LASTEXITCODE" }
 
 $latest = Get-ChildItem $saveDir -Filter '*.wav' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if ($latest) { Write-Host "Saved: $($latest.FullName)" }
+
+if ($latest -and -not $NoSeparate) {
+    Write-Host ''
+    & (Join-Path $PSScriptRoot 'separate-stems.ps1') -AudioFile $latest.FullName -Workspace $root
+}

@@ -2,3 +2,4 @@
 tools/*.exe
 workspace/
 config.json
+.venv/
