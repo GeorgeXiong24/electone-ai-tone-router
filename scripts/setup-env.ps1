@@ -35,5 +35,16 @@ Write-Host 'Installing bs-roformer-infer...'
 & $python -m pip install "bs-roformer-infer @ git+https://github.com/openmirlab/bs-roformer-infer.git"
 if ($LASTEXITCODE -ne 0) { throw 'bs-roformer-infer install failed.' }
 
+# Second-stage refinement (DrumSep and other specialist models) needs
+# audio-separator. It pins a few older deps that would break bs-roformer, so it
+# is installed without dependency resolution and the needed pieces are added
+# explicitly, keeping bs-roformer's versions intact.
+Write-Host 'Installing audio-separator (for specialist sub-stem models)...'
+& $python -m pip install audio-separator --no-deps
+if ($LASTEXITCODE -ne 0) { throw 'audio-separator install failed.' }
+
+& $python -m pip install --quiet librosa einops julius ml_collections packaging pydub requests resampy six tqdm audioread onnxruntime-gpu samplerate audioop-lts
+if ($LASTEXITCODE -ne 0) { Write-Host 'WARN: some audio-separator dependencies failed to install; refinement may be unavailable.' }
+
 Write-Host ''
 & $python -c "import torch, bs_roformer; print('torch', torch.__version__, '| cuda available:', torch.cuda.is_available())"

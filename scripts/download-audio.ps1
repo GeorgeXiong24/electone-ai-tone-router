@@ -72,9 +72,26 @@ if ($CookiesFromBrowser) {
 Write-Host "输入  : $Song"
 Write-Host "工作区: $root"
 Write-Host "输出  : $saveDir"
-Write-Host ''
 
-& $ytdlp @arguments
+$python = Join-Path $script:ElectoneRepoRoot '.venv\Scripts\python.exe'
+$progress = Join-Path $PSScriptRoot 'progress.py'
+$useProgress = (Test-Path $python) -and (Test-Path $progress)
+
+# Without UTF-8 the CJK stage label arrives as '?' and yt-dlp's CJK output can
+# raise UnicodeEncodeError on a GBK console.
+$env:PYTHONIOENCODING = 'utf-8'
+$env:PYTHONUTF8 = '1'
+
+if ($useProgress) {
+    # progress.py prints the [1/3] header itself.
+    & $python $progress run --stage 1 --of 3 --label '下载音频 / downloading' -- $ytdlp @arguments
+} else {
+    Write-Host ''
+    Write-Host ('=' * 64)
+    Write-Host '[1/3] 下载音频 / downloading audio'
+    Write-Host ('=' * 64)
+    & $ytdlp @arguments
+}
 if ($LASTEXITCODE -ne 0) { throw "yt-dlp failed with exit code $LASTEXITCODE" }
 
 $latest = Get-ChildItem $saveDir -Filter '*.wav' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -89,5 +106,7 @@ if ($latest) {
 
 if ($latest -and -not $NoSeparate) {
     Write-Host ''
+    $env:ELECTONE_STAGE_OFFSET = '1'
     & (Join-Path $PSScriptRoot 'separate-stems.ps1') -AudioFile $latest.FullName -Workspace $root
+    Remove-Item Env:\ELECTONE_STAGE_OFFSET -ErrorAction SilentlyContinue
 }
