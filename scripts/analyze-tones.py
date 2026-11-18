@@ -167,11 +167,62 @@ def analyze_stem(path, quick=False):
         classes = ((chroma >= 0.5 * frame_max) & (frame_max > 0.1)).sum(axis=0)
     feats["avg_pitch_classes"] = round(float(classes[active].mean()), 2)
 
+    # A piano stem carries both the accompaniment (low register) and often the
+    # melody (high register). pyin follows the loudest fundamental, which is
+    # almost always the bass note, so the melody is invisible to it. Track the
+    # high-passed signal separately: that is the line a right hand would play.
+    feats["melody"] = analyze_melody_register(y, sr, hop, active)
+
     feats["_frames"] = {
         "hop": hop, "sr": sr, "rms_db": rms_db, "voiced": voiced,
         "classes": classes, "f0": f0, "chroma": chroma, "onsets": onsets,
     }
     return feats
+
+
+def analyze_melody_register(y, sr, hop, active, split_hz=262.0):
+    """Track the melody line above `split_hz` (default C4).
+
+    Returns a dict describing whether a usable monophonic line exists up
+    there, or None when the stem has no high-register content.
+    """
+    import scipy.signal
+
+    sos = scipy.signal.butter(4, split_hz / (sr / 2), "highpass", output="sos")
+    y_hi = scipy.signal.sosfiltfilt(sos, y)
+
+    # A high-passed bass stem still has harmonics up there, and pyin happily
+    # locks onto them. Require the high band to carry real energy relative to
+    # the whole stem before believing any of it.
+    band_energy = float(np.sum(y_hi ** 2))
+    total_energy = float(np.sum(y ** 2)) + 1e-12
+    if band_energy / total_energy < 0.05:
+        return None
+
+    f0, voiced, _ = librosa.pyin(
+        y_hi, fmin=split_hz * 0.75, fmax=2000.0, sr=sr,
+        frame_length=2048, hop_length=hop,
+    )
+    if not voiced.any():
+        return None
+
+    f0_v = f0[voiced]
+    midi = librosa.hz_to_midi(f0_v)
+    # Step sizes: a melody moves mostly by small intervals, a chord
+    # progression jumps around. This separates the two.
+    steps = np.abs(np.diff(librosa.hz_to_midi(f0)))
+    steps = steps[np.isfinite(steps)]
+    smooth = float((steps < 2.0).mean()) if steps.size else 0.0
+
+    return {
+        "voiced_ratio": round(float(voiced.mean()), 3),
+        "register_midi": round(float(np.median(midi)), 1),
+        "range_midi": [round(float(np.percentile(midi, 10)), 1),
+                       round(float(np.percentile(midi, 90)), 1)],
+        "step_lt2_semitones": round(smooth, 3),
+        "high_band_share": round(band_energy / total_energy, 3),
+        "is_melodic": bool(voiced.mean() > 0.5 and smooth > 0.85),
+    }
 
 
 # ---------------------------------------------------------------- roles
@@ -297,6 +348,23 @@ def assign_roles(stems):
             keyboards = [main_kb] + [k for k in keyboards if k != main_kb]
         if name == "bass" and "脚" not in keyboards:
             keyboards.insert(0, "脚")
+
+        # A piano stem that carries a clean high-register line can serve both
+        # hands: the melody on the right, the accompaniment on the left. This
+        # is how the part is actually played, and it is the only way to get a
+        # right-hand line when the vocal stem is excluded.
+        mel = s.get("melody")
+        if mel and mel.get("is_melodic") and "右手" not in keyboards:
+            keyboards.insert(0, "右手")
+            s["melody_keyboard"] = "右手"
+
+        # `other` is the residual bucket: it holds whatever the separator could
+        # not name. It is a real instrument layer (here: bowed strings), but it
+        # is not a melody in its own right, so it must not claim the right hand
+        # on its own. Keep it as a right-hand doubling layer only.
+        if name == "other":
+            primary = ROLE_PAD
+            keyboards = ["右手"]
 
         s["primary_role"] = primary
         s["keyboards"] = keyboards
@@ -431,18 +499,27 @@ def main():
     ap.add_argument("--song", default="", help="substring of the song folder name")
     ap.add_argument("--out", default=os.path.join(WORKSPACE, "analysis"),
                     help="analysis output root")
+    ap.add_argument("--exclude", default="",
+                    help="comma-separated stems to ignore, e.g. vocals,other")
     args = ap.parse_args()
+
+    excluded = {s.strip() for s in args.exclude.split(",") if s.strip()}
 
     stem_dir = pick_stem_dir(args)
     song = os.path.basename(os.path.normpath(stem_dir))
     print(f"song: {song}")
     print(f"stems: {stem_dir}")
+    if excluded:
+        print(f"excluded: {', '.join(sorted(excluded))}")
 
     stems, refined = {}, {}
     for p in sorted(glob.glob(os.path.join(stem_dir, "*.wav"))):
         name = os.path.splitext(os.path.basename(p))[0]
         if name in DERIVED:
             print(f"  skip derived {name}.wav")
+            continue
+        if name in excluded:
+            print(f"  skip excluded {name}.wav")
             continue
         print(f"  analyzing {name}.wav ...", flush=True)
         feats = analyze_stem(p, quick=(name == "drums"))

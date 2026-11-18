@@ -18,7 +18,8 @@ Cantabile, one timbre per keyboard (Upper / Lower / Pedal).
 | Live progress reporting | Done |
 | Melody / chord / counter-melody analysis | Done |
 | Instrument → VST timbre mapping (sforzando / Surge XT / Decent Sampler) | Done |
-| Cantabile rack generation for ELB-02 | Planned |
+| Cantabile song generation for ELB-02 | Done |
+| Automatic Cantabile import | Done |
 
 ## How it works
 
@@ -33,11 +34,14 @@ Cantabile, one timbre per keyboard (Upper / Lower / Pedal).
 4. **Refine** (optional) — `scripts/refine-stems.py` runs specialist models only on the stems
    that actually carry audio, adding finer timbres next to the parent stems. Currently that's
    drums → `kick` / `snare` / `toms` / `hh` / `ride` / `crash`.
-5. **Analyze** (planned) — determine which instrument carries the main melody, which play
+5. **Analyze** — determine which instrument carries the main melody, which play
    chords / counter-melody, and which is the bass line.
-6. **Map & configure** (planned) — pick a matching VST timbre per part and generate a Cantabile
-   setup where Upper keyboard = melody, Lower keyboard = chords/counter-melody, Pedal = bass.
-7. **Play** — the ELB-02 acts as a MIDI controller, the PC produces the sound and routes it
+6. **Map & configure** — pick a matching VST timbre per part and generate a Cantabile song:
+   Upper keyboard = melody (MIDI channel 1), Lower = chords/counter-melody (channel 2),
+   Pedal = bass (channel 3).
+7. **Import** — after writing the `.cantabileSong`, ask whether to open it in Cantabile,
+   so plugins and patches are in place in one step.
+8. **Play** — the ELB-02 acts as a MIDI controller, the PC produces the sound and routes it
    back through the instrument's AUX IN. See [prerequisites.md](prerequisites.md) /
    [prerequisites_zh.md](prerequisites_zh.md) for hardware setup.
 
@@ -56,6 +60,13 @@ Read this before building anything on top of the stems. Measured on three refere
   `other = mix − (vocals + drums + bass + guitar + piano)`. It holds brass, pads, strings and
   whatever else the model could not assign. Never treat `other.wav` as "the piano part" or any
   single timbre.
+- **But the residual bucket holds real instruments, not garbage.** It cannot be used as one
+  timbre, yet it should not be thrown away either: measure what is in it, then pick a matching
+  patch. On 《蒲公英的約定》 the `other` stem is dominated by **bowed strings** — median attack
+  rise 93 ms (piano 70 ms, vocals 186 ms), longest continuous run **71 s**, spectral flatness
+  0.00086, onset rate 0.31/s. A piano cannot satisfy those numbers.
+  **Restoring strings with a pad preset yields a metallic fake**, so use a string patch
+  (`Violini Poly`). Judge with all three: attack time, longest sustained run, spectral flatness.
 - **`piano` may be empty even when the song has piano.** On 《晴天》 the piano stem was silent for
   the whole track (0 of 31 ten-second windows above −40 dB) while a solo piano intro sat in
   `other`. On 《不能說的祕密》 the same model produced usable piano (28 of 33 windows).
@@ -205,10 +216,23 @@ these numbers mean.
   harmonicity, polyphony) and musical role (melody / counter-melody / chords / accompaniment /
   pad / bass line / rhythm) on 5-second windows. Writes `workspace\analysis\<song>\analysis.json`
   plus a readable `analysis.md`.
+- **A piano stem hides two lines.** pyin follows the loudest fundamental, which on piano is
+  almost always the bass accompaniment note, so a naive analysis concludes "piano is 77% in
+  C2–C3, no melody". In reality the piano stem has 50–66% of its energy above C5.
+  `analyze_melody_register()` high-passes at C4 and tracks that band separately, using
+  ">85% of frame-to-frame steps under 2 semitones" to tell a melody from chord jumps.
+  Measured on 《蒲公英的約定》: melody sits in B3–C5 (median D4), 76% voiced, 97.9% stepwise.
+  So **one piano can serve both hands** — melody on the right, accompaniment on the left,
+  which is how the part is actually played. After high-passing, check the high-band energy
+  share (<5% means no melody), otherwise bass harmonics get mistaken for a melody.
+- `--exclude vocals,other` drops stems from the analysis. Excluding vocals leaves the piano's
+  high register as the right-hand melody.
 - `build-tones.py` turns the analysis into **single-instrument** tone files under
   `workspace\tone\<右手|左手|脚>\<plugin>\` — one file never mixes instruments. Right hand gets the
   melody, left hand gets chords/counter-melody/accompaniment, the pedal gets the bass line;
   drums produce no tone file (the ELB-02 rhythm section covers them).
+  When one stem feeds two keyboards, the filenames differ by role
+  (e.g. `钢琴(主旋律)` vs `钢琴(和弦)`).
 - Piano uses a sample-based source (sforzando + Accurate-Salamander grand piano SFZ); the SFZ
   config lives in the project and references the sample library by absolute path.
 - Surge tones are written as `.fxp` — Surge XT's native patch format, loadable by
@@ -235,6 +259,46 @@ these numbers mean.
   without a usable source note are reported honestly, not stretched).
 - Nothing is ever written into a plugin's default/user patch folder — the scripts refuse
   to write outside `workspace\tone\`. A `manifest.json` in that folder records what was produced.
+
+### Generate & import a Cantabile song
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\build-cantabile.py --song 蒲公英
+.\.venv\Scripts\python.exe .\scripts\import-cantabile.py --song 蒲公英
+```
+
+`build-cantabile.py` reads `tone\manifest.json`, creates one plugin instance per Surge XT tone,
+assigns MIDI channels per keyboard, and writes `workspace\cantabile\<song>.cantabileSong`:
+
+| Keyboard | MIDI channel | Timbres |
+| --- | --- | --- |
+| Upper (right hand) | 1 | melody + pad (several instances may share channel 1 and layer) |
+| Lower (left hand) | 2 | chords / counter-melody / accompaniment |
+| Pedal (foot) | 3 | bass line |
+
+- **Only Surge XT tones are imported**: SFZ/sforzando tones are skipped (sampled SFZ does not
+  reproduce the source timbre well enough) and vocals get no tone file (the melody is played
+  live). Generate with `build-tones.py --surge-only --no-vocals`.
+- Surge XT has no acoustic grand, so the piano part uses a Surge electric piano (`Keys/EP 1.fxp`).
+- `other` (the residual bucket) joins as a **right-hand doubling layer** using the string patch
+  `Polysynths/Violini Poly.fxp`, labelled "pad" — it never claims the melody, it only adds body.
+- The song file always lives in `workspace\cantabile\`; nothing is written into Cantabile's own
+  user folders.
+
+`import-cantabile.py` asks after building:
+
+```
+需要自动导入 Cantabile 吗？ [Y/n]
+```
+
+- `Y` — open the song with `Cantabile.exe`; plugins and patches load in one step.
+- `N` — keep the song file and open it yourself.
+- Non-interactive: `--yes` / `--no`; `--dry-run` builds without launching.
+
+Cantabile stores plugin state as `base64(raw-deflate(aBMP(VST3 state)))`;
+`scripts/cantabile_format.py` converts between `.fxp` and that container.
+`build-cantabile.py --self-test` round-trips a real song file byte-for-byte, so a format
+change fails immediately.
 
 ### Workspace
 
@@ -270,9 +334,9 @@ automatically). Prefer the 6-stem model plus refinement.
 | BS-RoFormer-SW checkpoint (jarredou, mirrored by enerjazzer) | 6-stem separation weights | not stated — personal use fine, verify before commercial use |
 | [audio-separator](https://github.com/nomadkaraoke/python-audio-separator) | Specialist sub-stem models (also MDX23C / MelRoformer / SCNet) | MIT |
 | MDX23C DrumSep (aufr33, jarredou) | drums → kick/snare/toms/hh/ride/crash | see model repo |
-| [Surge XT](https://surge-synthesizer.github.io/) (planned) | Free synthesizer | GPLv3 |
-| sforzando / Decent Sampler (planned) | SFZ / DSP sample players | freeware |
-| [Cantabile](https://www.cantabilesoftware.com/) (planned) | VST host (Lite is free) | commercial |
+| [Surge XT](https://surge-synthesizer.github.io/) | Free synthesizer | GPLv3 |
+| sforzando / Decent Sampler | SFZ / DSP sample players | freeware |
+| [Cantabile](https://www.cantabilesoftware.com/) | VST host (Lite is free) | commercial |
 
 ## Notes & limitations
 
@@ -300,6 +364,9 @@ automatically). Prefer the 6-stem model plus refinement.
 | `analyze-tones.py` | per-stem instrument/timbre/role analysis → JSON + MD report |
 | `build-tones.py` | single-instrument Surge XT tones (`.fxp`, optional `--vstpreset`) |
 | `build-sample-tones.py` | cut single notes from each stem → sforzando SFZ instrument (`.sfz` + `.wav`) |
+| `build-cantabile.py` | generate a Cantabile song (`.cantabileSong`) with per-keyboard MIDI channels |
+| `import-cantabile.py` | build the song, then offer to open it in Cantabile |
+| `cantabile_format.py` | Cantabile plugin-state container (aBMP / VST3 state) ↔ `.fxp` |
 | `prune-stems.py` | keep the N loudest stems, fold the rest into `other` |
 | `progress.py` | stage headers, live percentage, heartbeat, failure reporting |
 | `align-model-config.py` | repair a model whose `chunk_size` breaks the chunker |
@@ -308,10 +375,9 @@ automatically). Prefer the 6-stem model plus refinement.
 
 ## Roadmap
 
-- Automatic Cantabile rack/song generation (Performer triggers / Network Server)
-- Live MIDI routing ELB-02 (Upper/Lower/Pedal) → Cantabile
 - Fallback for segments where separation fails (currently reported, not repaired)
 - Piano / keys subdivision once a freely usable specialist model exists
+- Decent Sampler tones (`.dspreset`) as an alternative to SFZ
 
 ## Related docs
 

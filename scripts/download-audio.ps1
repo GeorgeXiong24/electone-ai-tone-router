@@ -4,7 +4,9 @@
     [string]$Workspace,
     [string]$OutDir,
     [string]$CookiesFromBrowser,
-    [switch]$NoSeparate
+    [switch]$NoSeparate,
+    [switch]$NoTones,
+    [switch]$NoCantabile
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -109,4 +111,24 @@ if ($latest -and -not $NoSeparate) {
     $env:ELECTONE_STAGE_OFFSET = '1'
     & (Join-Path $PSScriptRoot 'separate-stems.ps1') -AudioFile $latest.FullName -Workspace $root
     Remove-Item Env:\ELECTONE_STAGE_OFFSET -ErrorAction SilentlyContinue
+
+    if (-not $NoTones) {
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($latest.FullName)
+        $python = Join-Path $script:ElectoneRepoRoot '.venv\Scripts\python.exe'
+        if (Test-Path $python) {
+            Write-Host ''
+            Write-Host ('=' * 64)
+            Write-Host '[3/3] 音色分析与生成 / analyzing and building tones'
+            Write-Host ('=' * 64)
+            & $python (Join-Path $PSScriptRoot 'analyze-tones.py') --song $name --exclude 'vocals'
+            if ($LASTEXITCODE -eq 0) {
+                # Surge XT only: SFZ tones do not reproduce the source timbre,
+                # and the melody is played live so vocals get no tone file.
+                & $python (Join-Path $PSScriptRoot 'build-tones.py') --song $name --surge-only --no-vocals
+            }
+            if ($LASTEXITCODE -eq 0 -and -not $NoCantabile) {
+                & $python (Join-Path $PSScriptRoot 'import-cantabile.py') --song $name
+            }
+        }
+    }
 }

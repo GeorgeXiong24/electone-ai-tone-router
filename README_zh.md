@@ -17,7 +17,8 @@
 | 实时进度显示 | 已完成 |
 | 主旋律 / 和弦 / 副旋律分析 | 已完成 |
 | 乐器 → VST 音色映射（sforzando / Surge XT / Decent Sampler） | 已完成 |
-| 生成 Cantabile（ELB-02）配置 | 规划中 |
+| 生成 Cantabile（ELB-02）配置 | 已完成 |
+| 自动导入 Cantabile | 已完成 |
 
 ## 实现原理
 
@@ -31,10 +32,11 @@
    （见[分离的局限](#分离的局限)）。
 4. **细分**（可选）—— `scripts/refine-stems.py` 只对真正有声音的轨运行专用模型，
    在父轨旁生成更细的音色。目前支持 drums → `kick` / `snare` / `toms` / `hh` / `ride` / `crash`。
-5. **分析**（规划中）—— 判定哪个乐器是主旋律、哪些是和弦/副旋律、哪个是低音线条。
-6. **映射与配置**（规划中）—— 为每个声部挑选对应的 VST 音色，并生成 Cantabile 配置：
-   右手键盘 = 主旋律，左手键盘 = 和弦/副旋律，脚键盘 = 低音。
-7. **演奏** —— ELB-02 只当 MIDI 控制器，电脑发声并通过 AUX IN 回到琴的音箱。
+5. **分析** —— 判定哪个乐器是主旋律、哪些是和弦/副旋律、哪个是低音线条。
+6. **映射与配置** —— 为每个声部挑选对应的 VST 音色，并生成 Cantabile 工程：
+   右手键盘 = 主旋律（MIDI 通道 1），左手键盘 = 和弦/副旋律（通道 2），脚键盘 = 低音（通道 3）。
+7. **导入** —— 生成 `.cantabileSong` 后询问是否自动用 Cantabile 打开，插件与音色一步到位。
+8. **演奏** —— ELB-02 只当 MIDI 控制器，电脑发声并通过 AUX IN 回到琴的音箱。
    硬件接线见 [prerequisites_zh.md](prerequisites_zh.md) / [prerequisites.md](prerequisites.md)。
 
 注意：分离出来的是**乐器轨**，不是音乐角色；"主旋律 vs 和弦"由分析步骤判定，而不是分离器。
@@ -50,6 +52,12 @@
 - **`other` 不是乐器轨**，它是残差桶——按定义
   `other = 混音 − (vocals + drums + bass + guitar + piano)`。里面装着铜管、pad、弦乐
   以及其他模型无法归类的成分。**不要把 `other.wav` 当作"钢琴轨"或任何单一音色。**
+- **但残差桶里装的是真实乐器，不是垃圾。** 它不能直接当单一音色用，却也不该直接丢弃：
+  先测里面是什么，再决定配什么音色。实测《蒲公英的約定》的 `other` 主要成分是**弓弦**——
+  起音上升时间中位 93 ms（钢琴 70 ms、人声 186 ms）、最长连续有声段 **71 秒**、
+  谱平坦度 0.00086、起音密度 0.31/秒。这些特征钢琴不可能满足。
+  **用 pad 预设去还原弦乐会得到金属感的假音色**，必须换成弦乐预设（如 `Violini Poly`）。
+  判断方法：起音时间 + 最长持续段 + 谱平坦度，三项一起看。
 - **即使原曲有钢琴，`piano` 轨也可能是空的。** 《晴天》全曲 piano 轨静音
   （31 个 10 秒窗口中 0 个高于 −40 dB），而独奏钢琴前奏落在了 `other` 里。
   同一模型在《不能說的祕密》上则分出了可用的钢琴（33 个窗口中有 28 个可用）。
@@ -187,10 +195,19 @@
 - `analyze-tones.py` 逐轨识别乐器、音色特点（亮度、音区、谐波、同时音数）并按 5 秒窗口
   判定音乐角色（主旋律 / 副旋律 / 和弦 / 伴奏 / 和声铺底 / 低音线条 / 节奏）。
   输出 `workspace\analysis\<歌曲>\analysis.json` 和可读的 `analysis.md`。
+- **钢琴轨里藏着两条线。** pyin 跟的是最响的基频，在钢琴上几乎总是低音伴奏音，
+  所以直接分析会得出"钢琴 77% 在 C2–C3、没有旋律"的错误结论。实际钢琴轨
+  C5 以上占 50–66%。`analyze_melody_register()` 先高通到 C4 以上再单独跟踪，
+  用「相邻帧 <2 半音的比例 >85%」区分旋律与和弦跳变。实测《蒲公英的約定》：
+  旋律音区 B3–C5（中位 D4）、有声占比 76%、级进比例 97.9%。
+  于是**钢琴可以同时占右手（旋律）和左手（和弦）**，这正是实际弹法。
+  高通后必须检查高频段能量占比（<5% 直接判无旋律），否则贝斯的泛音会被误判成旋律。
+- `--exclude vocals,other` 可排除指定轨。排除人声后右手主旋律由钢琴高音区承担。
 - `build-tones.py` 把分析结果生成**单乐器**音色文件，写到
   `workspace\tone\<右手|左手|脚>\<插件>\`——一个文件绝不混合多个乐器。
   右手 = 主旋律，左手 = 副旋律/和弦/伴奏，脚 = 低音线条；鼓组不生成音色文件
   （节奏由 ELB-02 自带 rhythm 处理）。
+  同一 stem 分到两个键盘时，文件名按角色区分（如「钢琴(主旋律)」与「钢琴(和弦)」）。
 - 钢琴走采样音源（sforzando + Accurate-Salamander 大钢琴 SFZ）：SFZ 配置放在项目里，
   以绝对路径引用采样库。
 - Surge 音色默认生成为 `.fxp` —— Surge 原生补丁格式，**拖进 Surge XT 窗口即可加载**
@@ -214,6 +231,44 @@
 - **绝不写入任何插件的默认/用户音色目录**——脚本会拒绝写到
   `workspace\tone\` 之外。`tone\manifest.json` 记录每次生成的文件清单和加载方式。
 
+### 生成并导入 Cantabile 工程
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\build-cantabile.py --song 蒲公英
+.\.venv\Scripts\python.exe .\scripts\import-cantabile.py --song 蒲公英
+```
+
+`build-cantabile.py` 读取 `tone\manifest.json`，为每个 Surge XT 音色生成一个插件实例，
+按键盘分配 MIDI 通道，输出 `workspace\cantabile\<歌曲名>.cantabileSong`：
+
+| 键盘 | MIDI 通道 | 音色来源 |
+| --- | --- | --- |
+| 右手（上键盘） | 1 | 主旋律 + 和声铺底（可多个实例同时进通道 1，叠加发声） |
+| 左手（下键盘） | 2 | 和弦 / 副旋律 / 伴奏（可多个实例同时进通道 2） |
+| 脚（脚键盘） | 3 | 低音线条 |
+
+- **只导入 Surge XT 音色**：SFZ/sforzando 音色不导入（采样音色还原度不够），
+  人声也不生成音色（旋律现场弹奏）。用 `build-tones.py --surge-only --no-vocals` 生成。
+- Surge XT 没有原声大钢琴，钢琴声部改用 Surge 电钢琴（`Keys/EP 1.fxp`）。
+- `other`（残差桶）作为**右手叠加层**参与，用弦乐预设 `Polysynths/Violini Poly.fxp`，
+  角色记为「和声铺底」——它不抢主旋律，只给右手加厚度。
+- 工程文件始终写在 `workspace\cantabile\` 内，**不会**写进 Cantabile 自己的用户目录。
+
+`import-cantabile.py` 生成工程后会询问：
+
+```
+需要自动导入 Cantabile 吗？ [Y/n]
+```
+
+- `Y` —— 用 `Cantabile.exe` 打开工程，插件和音色自动就位。
+- `N` —— 只保留工程文件，自己手动打开。
+- 非交互场景用 `--yes` / `--no`；`--dry-run` 只生成不启动。
+
+Cantabile 的插件状态是 `base64(raw-deflate(aBMP(VST3 state)))`，
+`scripts/cantabile_format.py` 负责在 `.fxp` 与这个容器之间转换。
+`build-cantabile.py --self-test` 会用真实工程文件做逐字节往返校验，
+格式一旦变化会立刻失败。
+
 ### 工作区
 
 所有步骤共用一个工作区根目录，优先级：
@@ -224,7 +279,8 @@
 4. 默认 `<项目根目录>\workspace`
 
 目录结构：`audio\`（下载）、`stems\`（分离结果）、`stems\<歌曲名>\refined\`（可选的二级细分）、
-`models\`（模型缓存）。`config.json` 记录本机路径，已在 `.gitignore` 中忽略。
+`models\`（模型缓存）、`tone\`（音色文件）、`cantabile\`（Cantabile 工程）。
+`config.json` 记录本机路径，已在 `.gitignore` 中忽略。
 
 ### 模型选择
 
@@ -246,9 +302,9 @@
 | BS-RoFormer-SW 权重（jarredou，enerjazzer 镜像） | 6 轨分离权重 | 未标注——个人使用没问题，商用请自行确认 |
 | [audio-separator](https://github.com/nomadkaraoke/python-audio-separator) | 专用细分模型（也支持 MDX23C / MelRoformer / SCNet） | MIT |
 | MDX23C DrumSep（aufr33、jarredou） | drums → kick/snare/toms/hh/ride/crash | 见模型仓库 |
-| [Surge XT](https://surge-synthesizer.github.io/)（规划中） | 免费合成器 | GPLv3 |
-| sforzando / Decent Sampler（规划中） | SFZ / DSP 采样播放器 | 免费软件 |
-| [Cantabile](https://www.cantabilesoftware.com/)（规划中） | VST 宿主（Lite 免费） | 商业软件 |
+| [Surge XT](https://surge-synthesizer.github.io/) | 免费合成器 | GPLv3 |
+| sforzando / Decent Sampler | SFZ / DSP 采样播放器 | 免费软件 |
+| [Cantabile](https://www.cantabilesoftware.com/) | VST 宿主（Lite 免费） | 商业软件 |
 
 ## 注意事项与限制
 
@@ -273,6 +329,9 @@
 | `analyze-tones.py` | 逐轨乐器/音色特点/角色分析 → JSON + MD 报告 |
 | `build-tones.py` | 生成 Surge XT 单乐器音色（`.fxp`；`--vstpreset` 可选） |
 | `build-sample-tones.py` | 从每条 stem 提取单音，生成 sforzando 采样音色（`.sfz` + `.wav`） |
+| `build-cantabile.py` | 生成 Cantabile 工程（`.cantabileSong`），按键盘分配 MIDI 通道 |
+| `import-cantabile.py` | 生成工程并询问是否自动用 Cantabile 打开 |
+| `cantabile_format.py` | Cantabile 插件状态容器（aBMP / VST3 state）与 `.fxp` 互转 |
 | `prune-stems.py` | 保留最响的 N 轨，其余折进 `other` |
 | `progress.py` | 阶段标头、实时百分比、心跳、失败报告 |
 | `align-model-config.py` | 修复 `chunk_size` 会导致分块器崩溃的模型配置 |
@@ -281,10 +340,9 @@
 
 ## 后续计划
 
-- 自动生成 Cantabile 的 rack/song 配置（Performer triggers / Network Server）
-- ELB-02（右手/左手/脚）→ Cantabile 的实时 MIDI 路由
 - 分离失效段落的兜底方案（目前只报告，不修复）
 - 等出现可免费使用的钢琴 / keys 专用模型后，再细分钢琴
+- 支持 Decent Sampler 音色（`.dspreset`）作为 SFZ 的替代
 
 ## 相关文档
 

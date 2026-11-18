@@ -73,14 +73,24 @@ TEMPLATES = {
     },
     "钢琴": {
         "kind": "sfz", "plugin": "sforzando", "name28": "Grand Piano",
+        # --surge-only swaps this for a Surge electric piano: Surge XT has no
+        # acoustic grand, and the SFZ route needs the Salamander library.
+        "surge_alternative": {
+            "kind": "surge", "plugin": "surge-xt", "name28": "Electric Piano",
+            "source": ["Keys/EP 1.fxp"],
+        },
     },
     "贝斯": {
         "kind": "surge", "plugin": "surge-xt", "name28": "Fingered Bass",
         "source": ["Basses/Fingered.fxp"],
     },
     "其他/混合": {
+        # `other` is the separator's residual bucket, but on this material its
+        # dominant content is bowed strings (slow 93 ms attacks, a 71 s
+        # sustained run, low spectral flatness). A pad preset smears that into
+        # a metallic buzz, so use the polyphonic string patch instead.
         "kind": "surge", "plugin": "surge-xt", "name28": "String Ensemble",
-        "source": ["Pads/Subtle Comb Strings.fxp"],
+        "source": ["Polysynths/Violini Poly.fxp"],
     },
 }
 
@@ -223,10 +233,12 @@ def build_sfz(template, out_path, header_lines):
 
 # ---------------------------------------------------------------- naming
 
-def resolve_template(instrument):
+def resolve_template(instrument, surge_only=False):
     t = TEMPLATES.get(instrument)
     if not t:
         return None
+    if surge_only and t.get("surge_alternative"):
+        t = t["surge_alternative"]
     if t["kind"] == "sfz":
         return dict(t, resolved=PIANO_SFZ)
     for rel in t.get("source", []):
@@ -252,20 +264,30 @@ def safe_name(v):
 
 
 def role_for_keyboard(stem, keyboard):
-    """Most relevant role of this stem that maps to the given keyboard."""
-    rule = {"右手": ["主旋律"], "左手": ["副旋律", "和弦", "伴奏", "和声铺底"],
+    """Most relevant role of this stem that maps to the given keyboard.
+
+    `primary_role` wins when it already maps to this keyboard: the analysis
+    step has cross-stem context (it knows `other` is a doubling layer, not the
+    melody) that the per-window shares alone cannot express.
+    """
+    rule = {"右手": ["主旋律", "和声铺底"],
+            "左手": ["副旋律", "和弦", "伴奏", "和声铺底"],
             "脚": ["低音线条"]}
+    primary = stem.get("primary_role", "")
+    if primary and primary in rule.get(keyboard, []):
+        return primary
     roles = stem.get("roles", {})
     best, best_share = None, -1.0
     for role, share in roles.items():
         if role in rule.get(keyboard, []) and share > best_share:
             best, best_share = role, share
-    return best or stem.get("primary_role", "")
+    return best or primary
 
 
 # ---------------------------------------------------------------- build
 
-def build_song(song, stems, dry_run=False, vstpreset=False):
+def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
+               skip_instruments=()):
     entries = []
     for stem_name, stem in stems.items():
         if stem.get("empty") or stem_name == "drums":
@@ -278,7 +300,10 @@ def build_song(song, stems, dry_run=False, vstpreset=False):
         if label is None:
             print(f"  skip {stem_name}: no tone template")
             continue
-        tpl = resolve_template(label)
+        if label in skip_instruments:
+            print(f"  skip {label}: excluded by --no-vocals")
+            continue
+        tpl = resolve_template(label, surge_only=surge_only)
         if tpl is None:
             print(f"  skip {label}: template not found")
             continue
@@ -385,6 +410,11 @@ def main():
     ap.add_argument("--vstpreset", action="store_true",
                     help="also write .vstpreset files (for VST3 hosts such as Cantabile)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--surge-only", action="store_true",
+                    help="use Surge XT for every instrument (no sforzando/SFZ); "
+                         "the piano becomes a Surge electric piano")
+    ap.add_argument("--no-vocals", action="store_true",
+                    help="skip vocal tones (the melody is played live)")
     args = ap.parse_args()
 
     analysis_path = pick_analysis(args)
@@ -396,8 +426,11 @@ def main():
     print(f"analysis: {analysis_path}")
     print(f"tone dir: {TONE_ROOT}")
 
+    skip = {"人声"} if args.no_vocals else set()
     entries = build_song(song, stems, dry_run=args.dry_run,
-                         vstpreset=args.vstpreset)
+                         vstpreset=args.vstpreset,
+                         surge_only=args.surge_only,
+                         skip_instruments=skip)
 
     if not args.dry_run:
         os.makedirs(TONE_ROOT, exist_ok=True)
