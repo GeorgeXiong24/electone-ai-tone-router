@@ -217,17 +217,22 @@ these numbers mean.
   loaded by the host's own preset mechanism and is not a Surge drop format.
 - **For a tone that actually sounds like the recording, use the sampled instruments.**
   Surge XT is a synthesizer with no sample playback, so factory presets cannot reproduce
-  the real voice/guitar/bass/string timbres. `build-sample-tones.py` cuts real single notes
-  out of each stem and builds a sforzando `.sfz` + its own `.wav` samples (one instrument
-  per `.sfz` and sample folder):
+  the real guitar/bass/string timbres. `build-sample-tones.py` builds a sforzando `.sfz` + its
+  own `.wav` samples from each stem (one instrument per `.sfz` and sample folder) with an
+  offline quality pipeline: onset + pitch-break segmentation, per-note quality gating
+  (voiced ratio, f0 stability, harmonicity, flatness), 2-3 loudness-clustered velocity
+  layers, per-key samples pre-rendered at exact pitch with the source spectral envelope
+  preserved (the engine never stretches audio), and period-aligned loops with the crossfade
+  baked into the wav. Vocals are not sampled (the melody is played live) and piano keeps
+  the Salamander grand-piano library instead of sliced stem notes:
 
   ```powershell
   .\.venv\Scripts\python.exe .\scripts\build-sample-tones.py --latest
   ```
 
-  Output goes to `workspace\tone\<右手|左手|脚>\sforzando\`, with note counts and pitch ranges
-  in `tone\sample-instruments.json`. The piano keeps the Salamander grand-piano library
-  instead of sliced stem notes.
+  Output goes to `workspace\tone\<右手|左手|脚>\sforzando\`; `tone\sample-instruments.json`
+  records accepted/rejected note counts, velocity layers and keyboard coverage (keys
+  without a usable source note are reported honestly, not stretched).
 - Nothing is ever written into a plugin's default/user patch folder — the scripts refuse
   to write outside `workspace\tone\`. A `manifest.json` in that folder records what was produced.
 

@@ -198,15 +198,19 @@
   需要给 VST3 宿主（Cantabile）用时加 `--vstpreset`，会额外生成 `.vstpreset`；
   它只能由宿主自己的预设机制加载，不是 Surge 的拖放格式。
 - **要"像原曲"，用采样音色**：Surge XT 是合成器、没有采样播放，工厂预设无法复现
-  人声/吉他/贝斯/弦乐的真实音色。`build-sample-tones.py` 从每条 stem 里切出真实单音，
-  生成 sforzando 的 `.sfz` + 对应 `.wav` 样本（每个 `.sfz` 及其 `samples/` 目录只含一件乐器）：
+  吉他/贝斯/弦乐的真实音色。`build-sample-tones.py` 从 stem 生成 sforzando 的 `.sfz` +
+  对应 `.wav` 样本（每个 `.sfz` 及其 `samples/` 目录只含一件乐器），流水线全离线：
+  起音 + 音高断裂切分、逐音质量筛选（voiced 比例、f0 稳定度、谐波性、谱平坦度）、
+  2-3 个响度聚类力度层、**每个琴键各自按精确音高预渲染**并保留原频谱包络
+  （引擎不做任何拉伸）、周期对齐的循环点且交叉淡化直接烘进 wav。
+  人声不做采样（旋律由现场弹奏），钢琴仍用 Salamander 大钢琴采样库：
 
   ```powershell
   .\.venv\Scripts\python.exe .\scripts\build-sample-tones.py --latest
   ```
 
-  输出到 `workspace\tone\<右手|左手|脚>\sforzando\`，并在 `tone\sample-instruments.json`
-  记录每个音色的音符数与音域。钢琴不使用轨道切片，仍用 Salamander 大钢琴采样库。
+  输出到 `workspace\tone\<右手|左手|脚>\sforzando\`；`tone\sample-instruments.json`
+  记录采纳/拒绝的音符数、力度层与键盘覆盖率（没有可用素材的键如实留空，不硬拉伸）。
 - **绝不写入任何插件的默认/用户音色目录**——脚本会拒绝写到
   `workspace\tone\` 之外。`tone\manifest.json` 记录每次生成的文件清单和加载方式。
 

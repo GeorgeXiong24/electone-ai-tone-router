@@ -49,9 +49,11 @@ FACTORY = os.environ.get("SURGE_FACTORY") or r"C:\ProgramData\Surge XT\patches_f
 LOCAL_PATCHES = os.path.join(os.path.expanduser("~"), "Documents", "Surge XT", "Patches")
 SAMPLE_LIBRARIES = os.environ.get("SAMPLE_LIBRARIES") or r"D:\SampleLibraries"
 
+# sfz_daw is the full-quality variant (sfz_live trades velocity layers for
+# lower CPU); tone quality is the priority here.
 PIANO_SFZ = os.path.join(
     SAMPLE_LIBRARIES, "AccurateSalamanderGrandPianoV6.2e_48khz24bit",
-    "sfz_live", "Accurate-SalamanderGrandPiano_flat.Recommended.sfz")
+    "sfz_daw", "Accurate-SalamanderGrandPiano_flat.Recommended.sfz")
 
 # instrument label (from analysis) -> tone template
 #   kind "surge": copy an .fxp and rewrite its meta
