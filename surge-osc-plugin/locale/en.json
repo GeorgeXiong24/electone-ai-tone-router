@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Surge XT OSC tools",
+    "description": "Set and query Surge XT synthesizer parameters over OSC from the agent, for the timbre-replication workflow.",
+    "detail": "docs/DETAIL.md"
+  }
+}

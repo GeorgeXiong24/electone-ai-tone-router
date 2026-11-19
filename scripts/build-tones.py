@@ -9,8 +9,14 @@ Sound sources:
             the .sfz config lives in the project; the samples stay in
             <SAMPLE_LIBRARIES> and are referenced by absolute path.
   others -> Surge XT patches derived from a factory (or local) single-instrument
-            preset, with the patch <meta> rewritten to describe the analyzed
-            stem. The oscillator/filter design of the source preset is kept.
+            preset. The oscillator design of the source preset is kept, but the
+            filter cutoff, filter envelope and amp envelope are redesigned from
+            the analyzed stem's acoustic features (spectral centroid, attack vs
+            sustain brightness, harmonic ratio, ADSR-ish envelope stats) by
+            scripts/tone_design.py, and the patch <meta> is rewritten to
+            describe the analyzed stem. --no-param-design falls back to plain
+            template copying. Every designed value and its reason is recorded
+            in tone/manifest.json.
 
 Surge tones are written as `.fxp` — Surge XT's native patch format, loadable by
 dragging it onto the Surge XT window. With `--vstpreset`, a matching VST3 preset
@@ -40,6 +46,10 @@ import struct
 import sys
 import datetime
 import xml.etree.ElementTree as ET
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _cache_env  # noqa: E402  (redirect caches into the project workspace)
+import tone_design  # noqa: E402  (feature-driven Surge parameter design)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.environ.get("ELECTONE_WORKSPACE") or os.path.join(ROOT, "workspace")
@@ -208,6 +218,23 @@ def rewrite_meta(xml, name, category, comment):
     return out
 
 
+def apply_param_design(xml, params):
+    """Write natural-unit parameter values into the Surge preset XML.
+
+    Each parameter is a tag like <a_filter1_cutoff type="2" value="..."/>; the
+    value attribute is replaced while type and any <modrouting> children stay
+    untouched. Returns (xml, applied) with the parameters that were found.
+    """
+    applied = {}
+    for name, value in params.items():
+        pat = re.compile((rb'(<%s\b[^>]*?value=")([^"]*)(")' % name.encode("ascii")))
+        xml, n = pat.subn(lambda m, v=value: m.group(1) + b"%.6f" % v + m.group(3),
+                          xml, count=1)
+        if n == 1:
+            applied[name] = value
+    return xml, applied
+
+
 # ---------------------------------------------------------------- sfz io
 
 SAMPLE_RE = re.compile(r"sample=(\S+)")
@@ -287,7 +314,7 @@ def role_for_keyboard(stem, keyboard):
 # ---------------------------------------------------------------- build
 
 def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
-               skip_instruments=()):
+               skip_instruments=(), use_param_design=True):
     entries = []
     for stem_name, stem in stems.items():
         if stem.get("empty") or stem_name == "drums":
@@ -327,12 +354,30 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
                        f"谐波占比 {stem.get('harmonic_ratio', 0):.2f} | "
                        f"源：{tpl.get('source_label', 'sample library')} | "
                        f"单乐器音色，由 analyze-tones.py 分析生成")
+
+            # Feature-driven parameter design (tone_design.py): shapes the
+            # template's filter/envelopes to the analyzed stem instead of only
+            # relabelling it. The audit trail lands in the manifest.
+            design = None
+            applied = {}
+            if use_param_design and tpl["kind"] == "surge":
+                design = tone_design.design_patch_params(stem)
+                if design["notes"]:
+                    comment += (" | 参数设计：" + "；".join(
+                        f"{n['param']}={n['value']:.3f}" for n in design["notes"]))
             print(f"  {keyboard}/{tpl['plugin']}/{fname}")
 
             if dry_run:
-                entries.append({"file": os.path.relpath(out_path, TONE_ROOT),
-                                "keyboard": keyboard, "plugin": tpl["plugin"],
-                                "instrument": label, "role": role, "dry_run": True})
+                entry = {"file": os.path.relpath(out_path, TONE_ROOT),
+                         "keyboard": keyboard, "plugin": tpl["plugin"],
+                         "instrument": label, "role": role, "dry_run": True}
+                if design:
+                    entry["design"] = {
+                        "features": design["features"],
+                        "params": {k: round(v, 6) for k, v in design["params"].items()},
+                        "notes": design["notes"], "applied": False,
+                    }
+                entries.append(entry)
                 continue
 
             os.makedirs(plugin_dir, exist_ok=True)
@@ -355,6 +400,14 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
                 })
             else:
                 _, xml, extra = read_fxp(tpl["resolved"])
+                if design and design["params"]:
+                    xml, applied = apply_param_design(xml, design["params"])
+                    missing = [n["param"] for n in design["notes"]
+                               if n["param"] not in applied]
+                    if missing:
+                        raise RuntimeError(f"design params not found in preset: {missing}")
+                    for n in design["notes"]:
+                        print(f"      {n['param']} = {n['value']:.3f}  <- {n['reason']}")
                 meta_name = f"{song} · {label}（{role}·{keyboard}）"
                 xml = rewrite_meta(xml, meta_name, keyboard, comment)
                 write_fxp(out_path, tpl["name28"], xml, extra)
@@ -381,6 +434,13 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
                     "source": tpl["resolved"],
                     "bytes": os.path.getsize(out_path),
                 }
+                if design:
+                    entry["design"] = {
+                        "features": design["features"],
+                        "params": {k: round(v, 6) for k, v in applied.items()},
+                        "notes": [n for n in design["notes"] if n["param"] in applied],
+                        "applied": True,
+                    }
                 if vst_path:
                     entry["vstpreset"] = os.path.relpath(vst_path, TONE_ROOT)
                 entries.append(entry)
@@ -415,6 +475,9 @@ def main():
                          "the piano becomes a Surge electric piano")
     ap.add_argument("--no-vocals", action="store_true",
                     help="skip vocal tones (the melody is played live)")
+    ap.add_argument("--no-param-design", action="store_true",
+                    help="keep the template preset's filter/envelope values "
+                         "(disable the feature-driven parameter design)")
     args = ap.parse_args()
 
     analysis_path = pick_analysis(args)
@@ -430,7 +493,8 @@ def main():
     entries = build_song(song, stems, dry_run=args.dry_run,
                          vstpreset=args.vstpreset,
                          surge_only=args.surge_only,
-                         skip_instruments=skip)
+                         skip_instruments=skip,
+                         use_param_design=not args.no_param_design)
 
     if not args.dry_run:
         os.makedirs(TONE_ROOT, exist_ok=True)

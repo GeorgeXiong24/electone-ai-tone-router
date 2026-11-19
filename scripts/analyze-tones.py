@@ -29,6 +29,9 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _cache_env  # noqa: E402  (redirect caches into the project workspace)
+
 import numpy as np
 import soundfile as sf
 
@@ -173,6 +176,20 @@ def analyze_stem(path, quick=False):
     # high-passed signal separately: that is the line a right hand would play.
     feats["melody"] = analyze_melody_register(y, sr, hop, active)
 
+    # Envelope (ADSR-ish), attack-vs-sustain brightness and MFCC shape feed the
+    # feature-driven Surge parameter design in scripts/tone_design.py.
+    env = analyze_envelope(sr, hop, onsets, rms, active)
+    if env:
+        feats["envelope"] = env
+    atk_b, sus_b = analyze_brightness_contrast(sr, hop, onsets, centroid)
+    if atk_b is not None:
+        feats["brightness_attack_hz"] = round(atk_b, 0)
+        feats["brightness_sustain_hz"] = round(sus_b, 0)
+    if active.any():
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5)
+        feats["mfcc_mean"] = [round(float(v), 2)
+                              for v in np.median(mfcc[:, active], axis=1)]
+
     feats["_frames"] = {
         "hop": hop, "sr": sr, "rms_db": rms_db, "voiced": voiced,
         "classes": classes, "f0": f0, "chroma": chroma, "onsets": onsets,
@@ -223,6 +240,127 @@ def analyze_melody_register(y, sr, hop, active, split_hz=262.0):
         "high_band_share": round(band_energy / total_energy, 3),
         "is_melodic": bool(voiced.mean() > 0.5 and smooth > 0.85),
     }
+
+
+# ------------------------------------------------------- envelope & brightness
+
+def analyze_envelope(sr, hop, onsets, rms, active):
+    """Onset-aligned average note envelope -> ADSR-ish descriptors.
+
+    Averages the frame-RMS profile around every onset (peak-normalized), which
+    gives the "typical note shape" of the stem even for polyphonic material:
+      attack_ms     rise time from the pre-peak trough (10% -> 90% of peak)
+      decay_ms      peak -> first drop below 70% of the peak
+      sustain_level median level 0.5-1.2 s after the peak, relative to the peak
+      release_ms    median 20 dB fall time at the end of active runs
+      sustain_tendency  percussive / decaying / sustained
+
+    Onsets from flux detection fire near the energy peak, after most of the
+    rise, so the attack is measured from the averaged profile's own trough
+    (within 150 ms before the peak) instead of the onset instant.
+    """
+    if len(onsets) < 3:
+        return None
+    pre_f = max(1, int(0.15 * sr / hop))     # 150 ms before the onset
+    post_f = int(1.5 * sr / hop)             # 1.5 s after
+    floor = 10.0 ** (ACTIVE_DB / 20.0)
+
+    segs = []
+    for t0 in onsets:
+        i0 = int(round(t0 * sr / hop))
+        a, b = i0 - pre_f, i0 + post_f
+        if a < 0 or b > len(rms):
+            continue
+        seg = rms[a:b]
+        pk = float(seg.max())
+        if pk <= floor:
+            continue
+        segs.append(seg / pk)
+    if len(segs) < 3:
+        return None
+
+    avg = np.mean(np.vstack(segs), axis=0)
+    peak_i = int(np.argmax(avg[:max(1, int(0.5 * sr / hop))]))
+    peak = float(avg[peak_i])
+
+    trough_i = int(np.argmin(avg[:peak_i + 1]))
+    i10 = next((i for i in range(trough_i, len(avg)) if avg[i] >= 0.1 * peak),
+               trough_i)
+    i90 = next((i for i in range(i10, len(avg)) if avg[i] >= 0.9 * peak), i10)
+    attack_ms = max(0.0, (i90 - i10) * hop / sr * 1000.0)
+
+    dec_i = next((i for i in range(peak_i + 1, len(avg)) if avg[i] <= 0.7 * peak),
+                 None)
+    if dec_i is None:
+        decay_ms = (len(avg) - peak_i) * hop / sr * 1000.0
+    else:
+        decay_ms = (dec_i - peak_i) * hop / sr * 1000.0
+
+    s0 = peak_i + int(0.5 * sr / hop)
+    s1 = min(peak_i + int(1.2 * sr / hop), len(avg))
+    if s1 - s0 >= 3:
+        sustain_level = float(np.median(avg[s0:s1]) / peak)
+    else:
+        sustain_level = float(avg[-1] / peak)
+
+    if sustain_level < 0.2:
+        tendency = "percussive"
+    elif sustain_level < 0.55:
+        tendency = "decaying"
+    else:
+        tendency = "sustained"
+
+    # Release: the last 20 dB of every active run (a phrase tail / note offset).
+    rels = []
+    run_start = None
+    for i in range(len(active)):
+        if active[i] and run_start is None:
+            run_start = i
+        elif not active[i] and run_start is not None:
+            seg = rms[run_start:i]
+            if len(seg) >= 4:
+                end_db = 20.0 * np.log10(float(seg[-1]) + 1e-12)
+                j = len(seg) - 1
+                while (j > 0
+                       and 20.0 * np.log10(float(seg[j - 1]) + 1e-12) < end_db + 20.0):
+                    j -= 1
+                rels.append((len(seg) - j) * hop / sr * 1000.0)
+            run_start = None
+
+    return {
+        "attack_ms": round(attack_ms, 1),
+        "decay_ms": round(decay_ms, 1),
+        "sustain_level": round(sustain_level, 3),
+        "release_ms": round(float(np.median(rels)), 1) if rels else None,
+        "sustain_tendency": tendency,
+        "onsets_used": len(segs),
+    }
+
+
+def analyze_brightness_contrast(sr, hop, onsets, centroid):
+    """Transient vs. sustained spectral brightness around note onsets.
+
+    Returns (attack_hz, sustain_hz): the 75th-percentile centroid in the
+    100 ms around an onset (transients are brief; a median would average them
+    away) versus the median centroid 0.4-1.2 s after it. An attack brighter
+    than the sustain is the classic signature of a filter envelope (or a
+    pluck) and drives the filter env-mod design. (None, None) when there is
+    not enough evidence.
+    """
+    if len(onsets) < 3:
+        return None, None
+    atk, sus = [], []
+    for t0 in onsets:
+        i0 = int(round(t0 * sr / hop))
+        a0 = max(0, i0 - int(0.1 * sr / hop))
+        atk.extend(centroid[a0:i0 + int(0.1 * sr / hop)])
+        s0 = i0 + int(0.4 * sr / hop)
+        sus.extend(centroid[s0:s0 + int(0.8 * sr / hop)])
+    atk = [c for c in atk if c > 0]
+    sus = [c for c in sus if c > 0]
+    if len(atk) < 5 or len(sus) < 5:
+        return None, None
+    return float(np.percentile(atk, 75)), float(np.median(sus))
 
 
 # ---------------------------------------------------------------- roles
@@ -405,6 +543,17 @@ def describe(feats):
     if poly_txt:
         out.append(poly_txt)
     out.append(onset_txt)
+    env = feats.get("envelope")
+    if env:
+        rel = (f"{env['release_ms']:.0f}ms" if env.get("release_ms") is not None
+               else "未检出")
+        out.append(f"包络 起音 {env['attack_ms']:.0f}ms / 衰减 {env['decay_ms']:.0f}ms / "
+                   f"持续 {env['sustain_level']:.2f} / 释放 {rel}"
+                   f"（{env['sustain_tendency']}）")
+    ab = feats.get("brightness_attack_hz")
+    sb = feats.get("brightness_sustain_hz")
+    if ab and sb:
+        out.append(f"起音亮度 {ab:.0f}Hz vs 持续亮度 {sb:.0f}Hz（对比 {ab / sb:.2f}×）")
     out.append(f"有声占比 {feats['activity'] * 100:.0f}%，响度 {feats['rms_db']:.1f} dB")
     return out
 

@@ -119,3 +119,31 @@ function Save-ElectoneWorkspace {
     $config | Add-Member -NotePropertyName workspace -NotePropertyValue $Path -Force
     $config | ConvertTo-Json -Depth 4 | Set-Content -Path (Get-ElectoneConfigPath) -Encoding UTF8
 }
+
+# --- cache redirection: keep every cache inside the project workspace ---------
+# Tools (torch, HuggingFace, numba, pip, yt-dlp, ...) otherwise drop caches into
+# the user profile on C:. These helpers point them at <workspace>/cache and are
+# applied to every child process; scripts/_cache_env.py does the same for
+# direct `python scripts/<script>.py` runs.
+
+function Get-ElectoneCacheRoot {
+    if (-not $env:ELECTONE_CACHE) {
+        $env:ELECTONE_CACHE = Join-Path (Get-ElectoneWorkspace) 'cache'
+    }
+    if (-not (Test-Path $env:ELECTONE_CACHE)) {
+        New-Item -ItemType Directory -Force -Path $env:ELECTONE_CACHE | Out-Null
+    }
+    return $env:ELECTONE_CACHE
+}
+
+function Set-ElectoneCacheEnv {
+    $cache = Get-ElectoneCacheRoot
+    if (-not $env:XDG_CACHE_HOME) { $env:XDG_CACHE_HOME = $cache }
+    if (-not $env:TORCH_HOME) { $env:TORCH_HOME = Join-Path $cache 'torch' }
+    if (-not $env:HF_HOME) { $env:HF_HOME = Join-Path $cache 'huggingface' }
+    if (-not $env:NUMBA_CACHE_DIR) { $env:NUMBA_CACHE_DIR = Join-Path $cache 'numba' }
+    if (-not $env:MPLCONFIGDIR) { $env:MPLCONFIGDIR = Join-Path $cache 'matplotlib' }
+    if (-not $env:PIP_CACHE_DIR) { $env:PIP_CACHE_DIR = Join-Path $cache 'pip' }
+}
+
+Set-ElectoneCacheEnv

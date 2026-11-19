@@ -55,6 +55,7 @@ if ($Song -match '^https?://') {
 $arguments = @(
     $target
     '--no-playlist'
+    '--cache-dir', (Join-Path (Get-ElectoneCacheRoot) 'yt-dlp')
     '--ffmpeg-location', $toolsDir
     '-x'
     '--audio-format', 'wav'

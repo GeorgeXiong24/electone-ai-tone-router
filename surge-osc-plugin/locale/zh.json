@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Surge XT OSC 参数工具",
+    "description": "在对话中通过 OSC 设置与查询 Surge XT 合成器参数，服务于音色复刻工作流的执行层。",
+    "detail": "docs/DETAIL.md"
+  }
+}

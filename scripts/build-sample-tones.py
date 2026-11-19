@@ -43,6 +43,9 @@ import re
 import sys
 from fractions import Fraction
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _cache_env  # noqa: E402  (redirect caches into the project workspace)
+
 import numpy as np
 import scipy.signal
 import soundfile as sf

@@ -215,7 +215,10 @@ these numbers mean.
 - `analyze-tones.py` identifies each stem's instrument, timbre traits (brightness, register,
   harmonicity, polyphony) and musical role (melody / counter-melody / chords / accompaniment /
   pad / bass line / rhythm) on 5-second windows. Writes `workspace\analysis\<song>\analysis.json`
-  plus a readable `analysis.md`.
+  plus a readable `analysis.md`. It also measures the acoustic features that drive the patch
+  design below: an onset-aligned note envelope (attack / decay / sustain / release and a
+  percussive / decaying / sustained tendency), attack-vs-sustain brightness contrast
+  (spectral centroid) and 5 MFCC means.
 - **A piano stem hides two lines.** pyin follows the loudest fundamental, which on piano is
   almost always the bass accompaniment note, so a naive analysis concludes "piano is 77% in
   C2–C3, no melody". In reality the piano stem has 50–66% of its energy above C5.
@@ -233,6 +236,13 @@ these numbers mean.
   drums produce no tone file (the ELB-02 rhythm section covers them).
   When one stem feeds two keyboards, the filenames differ by role
   (e.g. `钢琴(主旋律)` vs `钢琴(和弦)`).
+- **Surge tones are designed from the audio, not just relabelled.** `scripts/tone_design.py`
+  maps the analyzed features onto Surge XT patch parameters — filter cutoff from the spectral
+  centroid, filter env-mod from attack-vs-sustain brightness, amp/filter envelopes from the
+  measured ADSR, resonance from harmonicity — and `build-tones.py` writes those values into
+  the `.fxp` (the template preset keeps its oscillator design). Every designed value and its
+  reason is recorded in `tone\manifest.json` and the patch comment; `--no-param-design` falls
+  back to plain template copying.
 - Piano uses a sample-based source (sforzando + Accurate-Salamander grand piano SFZ); the SFZ
   config lives in the project and references the sample library by absolute path.
 - Surge tones are written as `.fxp` — Surge XT's native patch format, loadable by
@@ -300,6 +310,16 @@ Cantabile stores plugin state as `base64(raw-deflate(aBMP(VST3 state)))`;
 `build-cantabile.py --self-test` round-trips a real song file byte-for-byte, so a format
 change fails immediately.
 
+### Live control: Surge XT OSC plugin
+
+`surge-osc-plugin/` is a DeepSeek Harness tool bundle — the execution layer of the
+Surge XT timbre-replication workflow described in `prompt.md`. It lets the agent set
+(`surge_set_param`) and read back (`surge_get_param`) Surge XT parameters over the
+synth's native OSC interface, with zero runtime dependencies. Install it from DSH's
+**Plugins → Add plugin** (or `plugin_manager install_bundle`); Surge-side setup and the
+query limitation (Surge sends query replies to its configured OSC output port) are
+documented in [surge-osc-plugin/README.md](surge-osc-plugin/README.md).
+
 ### Workspace
 
 All stages share one workspace root, resolved in this order:
@@ -310,7 +330,9 @@ All stages share one workspace root, resolved in this order:
 4. Default: `<project>\workspace`
 
 Layout: `audio\` (downloads), `stems\` (separation output), `stems\<song>\refined\` (optional
-second-stage stems), `models\` (model cache). `config.json` holds machine-local paths and is
+second-stage stems), `models\` (model weights), `tone\` (tone files), `cantabile\` (song files),
+`cache\` (tool caches — torch / HuggingFace / numba / pip / yt-dlp are redirected here so
+nothing is written into the user profile). `config.json` holds machine-local paths and is
 gitignored.
 
 ### Model choice
@@ -362,6 +384,7 @@ automatically). Prefer the 6-stem model plus refinement.
 | `check-stems.py` | per-window failure detection, per-stem usability |
 | `refine-stems.py` | specialist second-stage split (drums → 6 pieces) |
 | `analyze-tones.py` | per-stem instrument/timbre/role analysis → JSON + MD report |
+| `tone_design.py` | feature-driven Surge XT parameter design (unit conversions + decision rules) |
 | `build-tones.py` | single-instrument Surge XT tones (`.fxp`, optional `--vstpreset`) |
 | `build-sample-tones.py` | cut single notes from each stem → sforzando SFZ instrument (`.sfz` + `.wav`) |
 | `build-cantabile.py` | generate a Cantabile song (`.cantabileSong`) with per-keyboard MIDI channels |
@@ -371,7 +394,8 @@ automatically). Prefer the 6-stem model plus refinement.
 | `progress.py` | stage headers, live percentage, heartbeat, failure reporting |
 | `align-model-config.py` | repair a model whose `chunk_size` breaks the chunker |
 | `setup-env.ps1` | create `.venv`, install PyTorch + both inference backends |
-| `common.ps1` | workspace resolution, `artist - song` naming helpers |
+| `common.ps1` | workspace resolution, `artist - song` naming helpers, cache redirection |
+| `_cache_env.py` | redirect tool caches into `<workspace>\cache` for direct python runs |
 
 ## Roadmap
 
