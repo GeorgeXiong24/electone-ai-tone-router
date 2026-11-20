@@ -1,0 +1,6 @@
+# Loader patch for the Surge XT OSC tools bundle.
+# `install_bundle` (or Plugins > Add plugin) applies this row to the profile.
+- insert:
+    - id: surge-osc-tools
+      name: '@electone/surge-osc-tools'
+      config: {}

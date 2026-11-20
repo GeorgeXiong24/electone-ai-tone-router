@@ -24,6 +24,7 @@ patch format and the base64 blob Cantabile expects.
 """
 import base64
 import binascii
+import re
 import struct
 import zlib
 
@@ -199,6 +200,102 @@ def surge_plugin_data_from_fxp(fxp_path):
     _, xml, extra = read_fxp(fxp_path)
     state = build_vst3_state(surge_component_state(xml, extra), SURGE_CLASS_ID)
     return encode_plugin_data(state, SURGE_CLASS_ID)
+
+
+# ---------------------------------------------------------------- sforzando
+
+# sforzando (Plogue ARIA) stores its state as a small XML document wrapped in a
+# 'CEGP' chunk. The layout below was read out of a song file Cantabile itself
+# wrote with sforzando loaded, so every field is one the plugin produced:
+#
+#   component state = 4 zero bytes | uint32 version (515) | 'CEGP'
+#                     | uint32 xml length | zlib(xml, level 9)
+#
+# The XML is an <AriaSave> document whose <Slot name="..."> is the absolute
+# path of the .sfz to load. That single attribute is what makes the plugin play
+# our instrument, so it is the only thing this module rewrites.
+SFORZANDO_STATE_VERSION = 515
+SFORZANDO_CHUNK_TAG = b"CEGP"
+
+# The <Slot> body of a real sforzando state: 16 <Main> switches (only id 0 on)
+# plus one <Param>. Kept verbatim so the plugin sees the structure it wrote.
+_SFORZANDO_SLOT_BODY = (
+    "".join(f'        <Main id="{i}" value="{1 if i == 0 else 0}" />\n'
+            for i in range(16))
+    + '        <Param id="131" value="0.3228346407413483" />\n'
+)
+
+# The default Ambience reverb sforzando adds to a fresh instance. Without it
+# the sampled instrument sounds bone dry next to the Surge patches.
+_SFORZANDO_EFFECT = (
+    '    <EffectSlot id="0" sc="22" name="Ambience" bankId="1014" '
+    'version="1949" procMode="0">\n'
+    '        <Param id="10" value="0.9659950137138367" />\n'
+    '        <Param id="11" value="0.6516669988632202" />\n'
+    "    </EffectSlot>\n"
+)
+
+
+def sforzando_aria_xml(sfz_path):
+    """Build the <AriaSave> document that loads `sfz_path` into sforzando.
+
+    Two things here were learned the hard way:
+
+    * The XML declaration must name UTF-8. Without it ARIA falls back to the
+      system code page (GBK on a Chinese Windows), so a path containing CJK
+      characters is decoded as mojibake — `左手` becomes `宸︽墜` — and the plugin
+      silently loads nothing, rendering silence.
+    * `scala` must be empty. Pointing at `01 - equal.scl` makes ARIA look for
+      the file under its own install directory, fail, and abort the instrument
+      load; an empty value means "no Scala tuning", which is what we want.
+    """
+    # ARIA wants forward slashes even on Windows.
+    slot = sfz_path.replace("\\", "/")
+    return (
+        '<?xml version="1.0" encoding="UTF-8" ?>\r\n'
+        '<AriaSave version="1982" productID="1014">\r\n'
+        '    <Settings quality="1" streaming="32" maxStreamAllocMB="2048" '
+        'MIDIOutMode="1" automationSlot="0" liveMode="0" sc="22" '
+        'scala="" scalaCenter="60" globalTuning="0" />\r\n'
+        f'    <Slot id="0" name="{slot}" bankId="-1" version="0" channel="-1" '
+        'poly="128" tuning="0" pb_range="-1" ptrans="0" mtrans="0" '
+        'moctave="0" sc="16" mute="0">\r\n'
+        + _SFORZANDO_SLOT_BODY
+        + "    </Slot>\r\n"
+        + _SFORZANDO_EFFECT
+        + '    <GUI id="0" activeISlot="0" activeESlot="0" selectedTab="0" />\r\n'
+        "</AriaSave>\r\n"
+    )
+
+
+def sforzando_component_state(sfz_path):
+    """sforzando's VST3 component state for the given .sfz."""
+    xml = sforzando_aria_xml(sfz_path).encode("utf-8")
+    z = zlib.compress(xml, 9)
+    return (b"\x00" * 4 + struct.pack("<I", SFORZANDO_STATE_VERSION)
+            + SFORZANDO_CHUNK_TAG + struct.pack("<I", len(xml)) + z)
+
+
+def parse_sforzando_component_state(state):
+    """Inverse of sforzando_component_state -> (sfz_path, xml)."""
+    if state[8:12] != SFORZANDO_CHUNK_TAG:
+        raise ValueError("component state is not a sforzando CEGP chunk")
+    size = struct.unpack("<I", state[12:16])[0]
+    xml = zlib.decompress(state[16:])
+    if len(xml) != size:
+        raise ValueError("sforzando chunk length mismatch")
+    text = xml.decode("utf-8")
+    m = re.search(r'<Slot id="0" name="([^"]*)"', text)
+    if not m:
+        raise ValueError("sforzando state has no <Slot name=...>")
+    return m.group(1), text
+
+
+def sforzando_plugin_data_from_sfz(sfz_path):
+    """Return the base64 blob Cantabile expects for an .sfz instrument."""
+    state = build_vst3_state(sforzando_component_state(sfz_path),
+                             SFORZANDO_CLASS_ID)
+    return encode_plugin_data(state, SFORZANDO_CLASS_ID)
 
 
 # ---------------------------------------------------------------- self-check

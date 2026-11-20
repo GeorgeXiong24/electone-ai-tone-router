@@ -43,6 +43,9 @@ import re
 import sys
 from fractions import Fraction
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _cache_env  # noqa: E402  (redirect caches into the project workspace)
+
 import numpy as np
 import scipy.signal
 import soundfile as sf
@@ -58,6 +61,23 @@ CFG = {
     "pyin_chunk_s": 30.0,
     "pyin_overlap_s": 2.0,
 
+    # ---- hardware keyboard ranges (Yamaha ELB-02 / STAGEA Basic) -----------
+    # The instrument has three keyboards with different spans, and a sampled
+    # instrument only needs to cover the keys that can actually be pressed.
+    # Generating outside the range wastes samples and, worse, lets the
+    # transposition cap silently leave real keys uncovered.
+    #   Upper / Lower: 49 keys, C2..C6  -> MIDI 36..84
+    #   Pedal:         20 keys, C2..G3  -> MIDI 36..55
+    # Source: Yamaha ELB-02 specifications ("Number of Pedal Keys: 20,
+    # Range C-G"; "Upper (49 Range C-C) Lower (49 Range C-C)").
+    "keyboard_ranges": {
+        "右手": (36, 84),
+        "左手": (36, 84),
+        "脚": (36, 55),
+    },
+    # Fallback when a keyboard is not listed above.
+    "default_key_range": (36, 84),
+
     # ---- segmentation
     "onset_delta": 0.08,          # peak-pick threshold on median-normalized flux
     "onset_wait_ms": 50.0,        # min gap between onsets
@@ -68,6 +88,16 @@ CFG = {
     "min_note_s": 0.08,
     "max_note_s": 5.0,
     "tail_extend_floor_db": 30.0, # extend tail while >= peak - this
+    # A sampled instrument needs notes long enough to carry a timbre. On dense
+    # material (a strummed guitar fires an onset every ~0.18 s) the raw
+    # segmentation yields 0.18 s fragments, which are percussion, not notes:
+    # the resulting SFZ sounds like a plucked zither. Segments shorter than
+    # this are merged into their neighbour when the pitch agrees, and dropped
+    # when it does not.
+    "min_usable_note_s": 0.35,
+    # Two adjacent segments may be merged when their pitch is within this many
+    # semitones (a re-struck same note, or vibrato around one pitch).
+    "merge_pitch_tolerance_semitones": 0.6,
 
     # ---- quality gates
     "min_voiced_ratio": 0.6,
@@ -84,7 +114,32 @@ CFG = {
     "amp_veltrack": 40,
 
     # ---- rendering
-    "max_shift_semitones": 6.0,
+    # How far a source note may be transposed to fill a key. Resampling by more
+    # than a few semitones audibly changes the instrument: the formant
+    # correction keeps body resonances in place, but the attack transient and
+    # the harmonic balance still move, and a pad stretched a fifth sounds like a
+    # bell. Keys outside this window are left uncovered rather than faked.
+    "max_shift_semitones": 3.0,
+    # The pedal keyboard is the exception. Its 20 keys span C2..G3 while a bass
+    # stem typically only plays A1..D#2, so the upper half of the pedal has no
+    # source material at all. Pre-rendering those keys would mean stretching a
+    # bass by a whole octave, which no longer sounds like a bass; instead the
+    # pedal gets a modest window and the remaining keys are filled by the SFZ
+    # engine transposing the nearest rendered key (see write_instrument).
+    "max_shift_semitones_by_keyboard": {
+        "脚": 5.0,
+    },
+    # A rendered key must land within this many cents of its target. pyin can
+    # lock onto a harmonic instead of the fundamental (a fifth above is the
+    # classic failure: ratio 1.5), and transposing from that wrong f0 makes
+    # every key a fixed interval off — the instrument then plays wrong
+    # intervals, which reads as "a bell on one key, jazz on two".
+    "max_pitch_error_cents": 50.0,
+    # Sub-harmonic correction: a candidate f0/2, f0/3 or f0/1.5 is accepted as
+    # the true fundamental when its spectral peak reaches this fraction of the
+    # peak at the detected f0.
+    "subharmonic_energy_ratio": 0.25,
+    "f0_min_hz": 30.0,
     "fade_ms": 8.0,
     "highpass_hz": 20.0,
     "target_layer_rms_db": -18.0,
@@ -273,6 +328,59 @@ def analyze_segment(y_seg, f0_seg, sr, cfg):
     return feats
 
 
+def refine_f0(seg, sr, f0_hz, cfg):
+    """Return the true fundamental of a segment, correcting harmonic errors.
+
+    pyin reports the strongest periodicity, which on a bright or noisy source
+    is often a harmonic rather than the fundamental — a fifth above (ratio 1.5)
+    and an octave above (ratio 2.0) are the common cases. Transposing from a
+    wrong f0 makes every rendered key a fixed interval off, so the instrument
+    plays wrong intervals even though every file and region is valid.
+
+    The check is spectral: a true fundamental has energy at f0 and its
+    harmonics, while a harmonic mistaken for f0 has little or no energy at
+    f0/2 or f0/3. Walk down by the usual ratios and keep the lowest candidate
+    that still has real energy at its own fundamental.
+    """
+    import librosa
+
+    y = np.asarray(seg, dtype=np.float32)
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    if y.size < int(0.05 * sr) or not math.isfinite(f0_hz) or f0_hz <= 0:
+        return f0_hz
+
+    n_fft = cfg["n_fft"]
+    S = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=cfg["hop"]))
+    if S.size == 0:
+        return f0_hz
+    spec = S.mean(axis=1)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+
+    def energy_at(hz, tol=0.03):
+        """Peak energy in a narrow band around hz (relative to the spectrum)."""
+        if hz <= 0 or hz >= sr / 2:
+            return 0.0
+        lo, hi = hz * (1 - tol), hz * (1 + tol)
+        band = spec[(freqs >= lo) & (freqs <= hi)]
+        return float(band.max()) if band.size else 0.0
+
+    ref = energy_at(f0_hz)
+    if ref <= 0:
+        return f0_hz
+
+    # Candidate sub-harmonics, strongest first. A real fundamental must carry
+    # a meaningful fraction of the energy its harmonic does.
+    for ratio in (2.0, 3.0, 1.5):
+        cand = f0_hz / ratio
+        if cand < cfg["f0_min_hz"]:
+            continue
+        e = energy_at(cand)
+        if e >= ref * cfg["subharmonic_energy_ratio"]:
+            return cand
+    return f0_hz
+
+
 def gate_and_score(feats, cfg):
     reasons = []
     if feats["voiced_ratio"] < cfg["min_voiced_ratio"]:
@@ -348,6 +456,42 @@ def resample_by(seg, r):
     out = scipy.signal.resample_poly(seg.astype(np.float64), frac.numerator,
                                      frac.denominator)
     return out
+
+
+def verify_pitch(seg, sr, f_target, cfg):
+    """Return the rendered pitch error in cents, or None when unmeasurable.
+
+    The whole instrument depends on this: `render_note` transposes by
+    `f_target / f0_src`, so if the source's f0 was detected an octave or a
+    fifth off, every rendered key inherits that error and the instrument plays
+    the wrong intervals — a single key sounds like a bell, a chord sounds like
+    jazz, and nothing matches the recording.
+
+    pyin locks onto whichever harmonic is strongest, and on a bright or noisy
+    stem that is often not the fundamental (a fifth above is the classic case:
+    ratio 1.5). Measuring the *rendered* note catches that, because the error
+    is then a fixed interval away from the target.
+    """
+    import librosa
+
+    y = np.asarray(seg, dtype=np.float32)
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    if y.size < int(0.05 * sr):
+        return None
+    try:
+        f0, voiced, _ = librosa.pyin(
+            y, fmin=f_target * 0.6, fmax=f_target * 1.8,
+            sr=sr, frame_length=4096)
+    except Exception:
+        return None
+    f0v = f0[voiced]
+    if f0v.size < 3:
+        return None
+    measured = float(np.median(f0v))
+    if measured <= 0:
+        return None
+    return 1200.0 * math.log2(measured / f_target)
 
 
 def render_note(seg, f_target, f0_src, env0, cfg):
@@ -485,7 +629,55 @@ def finalize_wav(seg, sr, cfg):
 
 # ---------------------------------------------------------------- build
 
-def build_instrument(stem_wav, inst, dry_run=False):
+def merge_short_segments(segs, f0, sr, hop, cfg):
+    """Merge or drop segments too short to carry a timbre.
+
+    A sampled instrument is only as good as its notes. On dense material the
+    onset detector fires on every re-strike, so a strummed guitar yields 0.18 s
+    fragments — percussion, not notes — and an SFZ built from them sounds like
+    a plucked zither rather than a guitar.
+
+    Two adjacent segments are merged when their median pitch agrees within
+    `merge_pitch_tolerance_semitones` (a re-struck note, or vibrato around one
+    pitch). A short segment whose neighbour disagrees is dropped: it is a
+    transient, not a note.
+    """
+    import librosa
+
+    def seg_midi(s, e):
+        fa, fb = s // hop, max(s // hop + 1, e // hop)
+        f = f0[fa:fb]
+        f = f[np.isfinite(f)]
+        if f.size < 3:
+            return None
+        return float(np.median(librosa.hz_to_midi(f)))
+
+    min_len = int(cfg["min_usable_note_s"] * sr)
+    tol = cfg["merge_pitch_tolerance_semitones"]
+
+    out = []
+    for s, e in segs:
+        if out and (e - s) < min_len:
+            ps, pe = out[-1]
+            m_prev, m_cur = seg_midi(ps, pe), seg_midi(s, e)
+            if (m_prev is not None and m_cur is not None
+                    and abs(m_prev - m_cur) <= tol):
+                out[-1] = (ps, e)
+                continue
+            # Pitch disagrees: keep the longer of the two, drop the fragment.
+            if (pe - ps) >= (e - s):
+                continue
+            out[-1] = (s, e)
+            continue
+        out.append((s, e))
+
+    # A trailing fragment has no neighbour to merge into.
+    if out and (out[-1][1] - out[-1][0]) < min_len and len(out) > 1:
+        out.pop()
+    return out
+
+
+def build_instrument(stem_wav, inst, dry_run=False, keyboard="右手"):
     import librosa
 
     cfg = CFG
@@ -508,10 +700,14 @@ def build_instrument(stem_wav, inst, dry_run=False):
         e2 = extend_tail(rms, s, e, len(y), sr, hop, cfg)
         if (min(e2, len(y)) - s) / sr >= cfg["min_note_s"]:
             segs.append((s, min(e2, len(y))))
-    print(f"    {len(segs)} segments")
+    n_raw = len(segs)
+    segs = merge_short_segments(segs, f0, sr, hop, cfg)
+    print(f"    {n_raw} segments -> {len(segs)} usable "
+          f"(merged/dropped {n_raw - len(segs)} fragments)")
 
     notes = []
     reject_counts = {}
+    corrected = 0
     for s, e in segs:
         fa, fb = s // hop, max(s // hop + 1, e // hop)
         feats = analyze_segment(y[s:e], f0[fa:fb], sr, cfg)
@@ -520,6 +716,14 @@ def build_instrument(stem_wav, inst, dry_run=False):
             for r in reasons:
                 reject_counts[r] = reject_counts.get(r, 0) + 1
             continue
+        # pyin can report a harmonic instead of the fundamental; correct it
+        # before the note is used as a transposition reference.
+        true_f0 = refine_f0(y[s:e], sr, feats["f0_hz"], cfg)
+        if abs(1200.0 * math.log2(true_f0 / feats["f0_hz"])) > 1.0:
+            corrected += 1
+            feats["f0_hz_raw"] = feats["f0_hz"]
+            feats["f0_hz"] = true_f0
+            feats["midi_f"] = float(librosa.hz_to_midi(true_f0))
         notes.append({
             "start": s, "end": e,
             "midi": int(round(feats["midi_f"])),
@@ -528,6 +732,8 @@ def build_instrument(stem_wav, inst, dry_run=False):
             "score": score, "feats": feats,
             "audio": y[s:e].astype(np.float32),
         })
+    if corrected:
+        print(f"    corrected {corrected} harmonic f0 detection(s)")
     if not notes:
         return {"notes": [], "reject_counts": reject_counts}
 
@@ -550,16 +756,28 @@ def build_instrument(stem_wav, inst, dry_run=False):
 
     takes = pick_takes(notes)
 
-    # coverage: keys reachable from some take within the shift cap
-    max_cents = cfg["max_shift_semitones"] * 100.0
+    # coverage: keys reachable from some take within the shift cap, limited to
+    # the keys this keyboard physically has.
+    key_lo, key_hi = cfg["keyboard_ranges"].get(keyboard, cfg["default_key_range"])
+    shift_cap = cfg["max_shift_semitones_by_keyboard"].get(
+        keyboard, cfg["max_shift_semitones"])
+    max_cents = shift_cap * 100.0
     keys = set()
     for t in takes:
-        for k in range(max(21, t["midi"] - int(cfg["max_shift_semitones"])),
-                       min(109, t["midi"] + int(cfg["max_shift_semitones"]) + 1)):
+        for k in range(max(key_lo, t["midi"] - int(shift_cap)),
+                       min(key_hi, t["midi"] + int(shift_cap)) + 1):
             cents = 1200.0 * math.log2(librosa.midi_to_hz(k) / t["f0_hz"])
             if abs(cents) <= max_cents:
                 keys.add(k)
     keys = sorted(keys)
+
+    # Report the gap honestly: a keyboard whose source material sits below its
+    # own range cannot be covered by transposition alone.
+    missing = [k for k in range(key_lo, key_hi + 1) if k not in keys]
+    if missing:
+        print(f"    {keyboard} range {key_lo}..{key_hi}: "
+              f"{len(keys)} covered, {len(missing)} uncovered "
+              f"({missing[0]}..{missing[-1]})")
 
     if dry_run:
         return {"notes": notes, "takes": takes, "keys": keys,
@@ -572,6 +790,8 @@ def build_instrument(stem_wav, inst, dry_run=False):
     layer_gains_db = {l: centroids[l] - centroids[0] for l in range(n_layers)}
     looped = 0
     max_shift = 0.0
+    pitch_rejects = 0
+    pitch_reject_examples = 0
 
     for l in range(n_layers):
         for k in keys:
@@ -592,6 +812,19 @@ def build_instrument(stem_wav, inst, dry_run=False):
                 env_cache[tid] = spectral_envelope(t["audio"], cfg)
             out, _ = render_note(t["audio"], librosa.midi_to_hz(k),
                                  t["f0_hz"], env_cache[tid], cfg)
+
+            # Verify the rendered pitch before accepting it. A source whose f0
+            # was detected a fifth or an octave off produces a note that is
+            # musically wrong even though every file and region is valid, so
+            # the check has to be on the audio, not on the metadata.
+            err = verify_pitch(out, sr, librosa.midi_to_hz(k), cfg)
+            if err is not None and abs(err) > cfg["max_pitch_error_cents"]:
+                pitch_rejects += 1
+                if pitch_reject_examples < 5:
+                    pitch_reject_examples += 1
+                    print(f"      reject k{k}: rendered {err:+.0f} cents off "
+                          f"(source f0 {t['f0_hz']:.1f} Hz)")
+                continue
             loop = find_loop(out, sr, librosa.midi_to_hz(k), cfg)
             if loop:
                 looped += 1
@@ -613,6 +846,7 @@ def build_instrument(stem_wav, inst, dry_run=False):
             "layers": n_layers, "layer_wavs": layer_wavs,
             "vel_ranges": vel_ranges(n_layers),
             "looped": looped, "max_shift_cents": max_shift,
+            "pitch_rejects": pitch_rejects,
             "reject_counts": reject_counts,
             "centroids_db": centroids}
 
@@ -621,13 +855,46 @@ def vel_ranges(k):
     return [(1 + 127 * i // k, 127 * (i + 1) // k) for i in range(k)]
 
 
+def ascii_keyboard(keyboard):
+    """ASCII directory name for a keyboard.
+
+    ARIA decodes the whole .sfz path with the system code page, so the parent
+    directories have to be ASCII too — not just the filename.
+    """
+    return {"右手": "right", "左手": "left", "脚": "pedal"}.get(keyboard, "kb")
+
+
+def ascii_slug(text, max_len=48):
+    """A filesystem-safe ASCII slug for a name that may be CJK.
+
+    sforzando's ARIA engine decodes the .sfz path with the system code page
+    (GBK on a Chinese Windows), not UTF-8, so any CJK character in the path
+    becomes mojibake and the instrument silently loads nothing. The sample
+    directory and the .sfz filename therefore have to be pure ASCII; the
+    human-readable name stays in the SFZ comment and the manifest.
+    """
+    import hashlib
+
+    # Keep ASCII letters/digits, collapse everything else to single dashes.
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-")
+    slug = re.sub(r"-{2,}", "-", slug)
+    if not slug:
+        slug = "tone"
+    # A short hash keeps two different CJK names from colliding once their
+    # non-ASCII characters are stripped.
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return f"{slug[:max_len]}-{digest}"
+
+
 def write_instrument(song, label, role, keyboard, built, TONE_root):
+    key_lo, key_hi = CFG["keyboard_ranges"].get(keyboard, CFG["default_key_range"])
     base = safe_name(f"{song} - {label}")
-    # the sample dir name goes into default_path= where SFZ values end at
-    # whitespace, so it must not contain spaces (the .sfz filename may)
-    sample_slug = re.sub(r"\s+", "_", base)
-    plugin_dir = os.path.join(TONE_root, keyboard, "sforzando")
-    sfz_path = os.path.join(plugin_dir, base + ".sfz")
+    # The .sfz filename and its sample directory must be ASCII (see ascii_slug):
+    # ARIA reads them with the system code page, so CJK would not resolve.
+    slug = ascii_slug(f"{song} - {label}")
+    sample_slug = slug
+    plugin_dir = os.path.join(TONE_root, ascii_keyboard(keyboard), "sforzando")
+    sfz_path = os.path.join(plugin_dir, slug + ".sfz")
     sample_dir = os.path.join(plugin_dir, "samples", sample_slug)
     if not os.path.abspath(sfz_path).startswith(os.path.abspath(TONE_root) + os.sep):
         raise RuntimeError(f"refusing to write outside tone dir: {sfz_path}")
@@ -647,6 +914,7 @@ def write_instrument(song, label, role, keyboard, built, TONE_root):
         "// Spectral envelope of the source is preserved so body resonances do not shift.",
         f"// Velocity layers: {built['vel_ranges']} (loudness clusters of the recording).",
         "// Looped regions have the loop crossfade baked into the wav (engine-independent).",
+        f"// Keyboard range: {key_lo}..{key_hi} (Yamaha ELB-02 hardware).",
         "",
         "<control>",
         f"default_path=samples/{sample_slug}/",
@@ -668,6 +936,38 @@ def write_instrument(song, label, role, keyboard, built, TONE_root):
                            f" loop_end={w['loop'][1]}")
             lines.append(region)
         lines.append("")
+
+    # Keys the pre-rendered set does not reach are covered by letting the
+    # engine transpose the nearest rendered key. A bass stem only plays A1..D#2
+    # while the pedal spans C2..G3, so the top of the pedal has no source
+    # material; stretching one sample a few semitones is far better than a dead
+    # key, and it keeps the sample itself at a pitch where the instrument still
+    # sounds like itself.
+    #
+    # Only keys with no rendered region at all are filled: emitting a second
+    # region for a key that already has one would stack two voices on that key
+    # (louder, and phasey where the two copies differ).
+    covered = {w["key"] for wavs in built["layer_wavs"].values() for w in wavs}
+    gaps = [k for k in range(key_lo, key_hi + 1) if k not in covered]
+    if gaps:
+        lines.append("// Keys below are filled by engine transposition from the "
+                     "nearest rendered key.")
+        for l in range(built["layers"]):
+            lo, hi = built["vel_ranges"][l]
+            lines.append(f"<master> lovel={lo} hivel={hi}")
+            for k in gaps:
+                src = min(covered, key=lambda c: abs(c - k))
+                w = next(w for w in built["layer_wavs"][l] if w["key"] == src)
+                region = (f"<region> sample={w['file']} pitch_keycenter={src} "
+                          f"lokey={k} hikey={k}")
+                if w["loop"]:
+                    region += (f" loop_mode=loop_sustain loop_start={w['loop'][0]}"
+                               f" loop_end={w['loop'][1]}")
+                lines.append(region)
+            lines.append("")
+        print(f"    {len(gaps)} key(s) filled by engine transposition: "
+              f"{gaps[0]}..{gaps[-1]}")
+
     with open(sfz_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return sfz_path, sample_dir
@@ -676,21 +976,37 @@ def write_instrument(song, label, role, keyboard, built, TONE_root):
 # ---------------------------------------------------------------- song build
 
 def role_for_keyboard(stem, keyboard):
-    """Most relevant role of this stem that maps to the given keyboard."""
+    """Most relevant role of this stem that maps to the given keyboard.
+
+    `primary_role` wins when it already maps to this keyboard: the analysis
+    step has cross-stem context (it knows which stem owns the melody after
+    arbitration) that the per-window shares alone cannot express. Without this
+    a stem that comps most of the time but carries the tune is labelled
+    "accompaniment" on the right hand too.
+    """
     rule = {"右手": ["主旋律"], "左手": ["副旋律", "和弦", "伴奏", "和声铺底"],
             "脚": ["低音线条"]}
+    primary = stem.get("primary_role", "")
+    if primary and primary in rule.get(keyboard, []):
+        return primary
     roles = stem.get("roles", {})
     best, best_share = None, -1.0
     for role, share in roles.items():
         if role in rule.get(keyboard, []) and share > best_share:
             best, best_share = role, share
-    return best or stem.get("primary_role", "")
+    return best or primary
 
 
 def build_song(song, stems, stems_dir, dry_run=False):
     entries = []
     for stem_name, stem in stems.items():
         if stem.get("empty"):
+            continue
+        if stem.get("unusable"):
+            # Too little audible content after removing separation failures:
+            # slicing notes out of it would sample noise, not an instrument.
+            print(f"  skip {stem_name}: only {stem.get('activity', 0) * 100:.1f}% "
+                  f"audible after removing separation failures")
             continue
         if stem_name in SKIP_STEMS:
             print(f"  skip {stem_name}: {SKIP_STEMS[stem_name]}")
@@ -706,20 +1022,31 @@ def build_song(song, stems, stems_dir, dry_run=False):
             continue
 
         print(f"  {label}: analyzing ...")
-        built = build_instrument(stem_wav, inst, dry_run=dry_run)
-        if not built or not built.get("notes"):
-            print(f"  skip {label}: no usable notes "
-                  f"(rejected: {built.get('reject_counts') if built else {}})")
+        # A stem can serve several keyboards, and each keyboard has its own
+        # physical range (the pedal is 20 keys, the manuals are 49). Build one
+        # instrument per keyboard so the sample set covers exactly the keys
+        # that can be pressed, instead of generating a wide range once and
+        # hoping it lines up.
+        built_by_kb = {}
+        for keyboard in stem.get("keyboards", []):
+            built = build_instrument(stem_wav, inst, dry_run=dry_run,
+                                     keyboard=keyboard)
+            if not built or not built.get("notes"):
+                print(f"  skip {label}/{keyboard}: no usable notes "
+                      f"(rejected: {built.get('reject_counts') if built else {}})")
+                continue
+            built_by_kb[keyboard] = built
+
+        if not built_by_kb:
             continue
 
-        n_keys = len(built.get("keys", []))
-        print(f"  {label}: {len(built['notes'])} notes accepted, "
-              f"{built.get('layers', 0)} velocity layers, "
-              f"{n_keys} keys covered"
-              + (f", MIDI {built['keys'][0]}..{built['keys'][-1]}" if n_keys else ""))
-
-        for keyboard in stem.get("keyboards", []):
+        for keyboard, built in built_by_kb.items():
             role = role_for_keyboard(stem, keyboard)
+            n_keys = len(built.get("keys", []))
+            print(f"  {label}/{keyboard}: {len(built['notes'])} notes accepted, "
+                  f"{built.get('layers', 0)} velocity layers, "
+                  f"{n_keys} keys covered"
+                  + (f", MIDI {built['keys'][0]}..{built['keys'][-1]}" if n_keys else ""))
             if dry_run:
                 entries.append({"keyboard": keyboard, "instrument": label,
                                 "role": role, "dry_run": True,
@@ -742,6 +1069,7 @@ def build_song(song, stems, stems_dir, dry_run=False):
                 "key_range": [built["keys"][0], built["keys"][-1]] if n_keys else [],
                 "looped_samples": built["looped"],
                 "max_source_shift_cents": round(built["max_shift_cents"], 1),
+                "pitch_rejected_keys": built.get("pitch_rejects", 0),
             })
     return entries
 

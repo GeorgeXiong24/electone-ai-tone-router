@@ -195,6 +195,9 @@
 - `analyze-tones.py` 逐轨识别乐器、音色特点（亮度、音区、谐波、同时音数）并按 5 秒窗口
   判定音乐角色（主旋律 / 副旋律 / 和弦 / 伴奏 / 和声铺底 / 低音线条 / 节奏）。
   输出 `workspace\analysis\<歌曲>\analysis.json` 和可读的 `analysis.md`。
+  同时测量驱动下面音色参数设计的声学特征：起音对齐的典型音符包络
+  （起音 / 衰减 / 持续 / 释放 + 打击性 / 衰减型 / 持续型倾向）、
+  起音与持续段的亮度对比（谱质心）以及 5 维 MFCC 均值。
 - **钢琴轨里藏着两条线。** pyin 跟的是最响的基频，在钢琴上几乎总是低音伴奏音，
   所以直接分析会得出"钢琴 77% 在 C2–C3、没有旋律"的错误结论。实际钢琴轨
   C5 以上占 50–66%。`analyze_melody_register()` 先高通到 C4 以上再单独跟踪，
@@ -208,6 +211,18 @@
   右手 = 主旋律，左手 = 副旋律/和弦/伴奏，脚 = 低音线条；鼓组不生成音色文件
   （节奏由 ELB-02 自带 rhythm 处理）。
   同一 stem 分到两个键盘时，文件名按角色区分（如「钢琴(主旋律)」与「钢琴(和弦)」）。
+- **Surge 音色是按音频设计的，不是只换标签。** `scripts/tone_design.py` 把分析出的声学特征
+  映射为 Surge XT 补丁参数——滤波截止频率取自谱质心、滤波包络深度取自起音/持续亮度对比、
+  放大与滤波包络取自实测 ADSR、共振取自谐波占比——`build-tones.py` 把这些值写进 `.fxp`
+  （模板预设的振荡器设计保留）。每个设计值及其依据都会记录到 `tone\manifest.json` 和
+  补丁注释里；加 `--no-param-design` 可退回纯模板复制。
+  设计**受模板约束**，因为测量值不等于音色设计：
+  - 截止频率最多只能在模板自身 cutoff 的 ±1.5 八度内移动，否则一个偏暗的轨道会把明亮的
+    音色拖成闷掉的正弦波；
+  - 非低通滤波器完全保留模板 cutoff——陷波滤波器没有「亮度」可以打开；
+  - 模板的滤波包络深度只要达到设计值的一半就保留，从而保住击弦类乐器的起音特征；
+  - 实测起音有 8ms 下限（起音检测在上升之后才触发，会低估），实测衰减短于倾向区间下限时
+    以实测为准。
 - 钢琴走采样音源（sforzando + Accurate-Salamander 大钢琴 SFZ）：SFZ 配置放在项目里，
   以绝对路径引用采样库。
 - Surge 音色默认生成为 `.fxp` —— Surge 原生补丁格式，**拖进 Surge XT 窗口即可加载**
@@ -247,11 +262,34 @@
 | 左手（下键盘） | 2 | 和弦 / 副旋律 / 伴奏（可多个实例同时进通道 2） |
 | 脚（脚键盘） | 3 | 低音线条 |
 
-- **只导入 Surge XT 音色**：SFZ/sforzando 音色不导入（采样音色还原度不够），
-  人声也不生成音色（旋律现场弹奏）。用 `build-tones.py --surge-only --no-vocals` 生成。
-- Surge XT 没有原声大钢琴，钢琴声部改用 Surge 电钢琴（`Keys/EP 1.fxp`）。
-- `other`（残差桶）作为**右手叠加层**参与，用弦乐预设 `Polysynths/Violini Poly.fxp`，
-  角色记为「和声铺底」——它不抢主旋律，只给右手加厚度。
+- **同一声部，采样音色永远优先于合成器预设。** Surge XT 是合成器：它的工厂预设是振荡器设计，
+  用它去模仿录到的吉他或贝斯，得到的是**另一件乐器**——尼龙吉他预设听起来像拨弦古筝，
+  指弹贝斯预设听起来像弱音小号。只有 stem 本身携带录音的真实音色，所以当
+  `build-sample-tones.py` 为某个声部生成了 `.sfz`，导入的就是它，同一声部的 Surge 补丁被跳过。
+  钢琴是反方向的例外：始终用 Salamander 采样大钢琴。
+- **采样音色的路径必须是纯 ASCII。** sforzando 的 ARIA 引擎用系统代码页（中文 Windows 上是 GBK）
+  解码 `.sfz` 路径，而不是 UTF-8，所以中文路径会变成乱码（`左手` → `宸︽墜`），插件静默加载失败。
+  因此键盘目录是 `right` / `left` / `pedal`，采样音色用 ASCII slug 文件名；可读的中文名保留在
+  SFZ 注释和 manifest 里。Surge `.fxp` 保留中文名，因为 Surge 自己读它。
+- **右手只归一个 stem。** 多个 stem 都可能有像样的高音线，但 ELB-02 只有一个右手。
+  `analyze-tones.py` 会仲裁：高音旋律证据最强的 stem 拿右手，其余降为左手副旋律。
+  残差桶 `other` 是叠加层，只有在右手空着时才占右手。
+- **左手只留一个伴奏乐器。** 两个不同乐器响应同一个键不是叠加，是冲突：pad 和钢琴和弦一起响
+  会互相拍频，听感就是「按一个音是古钟、按两个音是 jazz」。当已有真正的伴奏 stem 占左手时，
+  残差桶从左手移除；贝斯只走脚键盘（在左手再叠一遍只会把和弦糊掉）。
+- **每个渲染出的采样都做音高验证。** `render_note` 按 `f_target / f0_src` 移调，所以源采样的
+  f0 若被检测成五度或八度偏移，每个键都会固定错一个音程——文件格式全对，乐器却在弹错音。
+  两道防线：`refine_f0()` 按常见次谐波比（÷2、÷3、÷1.5）向下试探，保留在自己基频处仍有真实
+  频谱能量的最低候选；`verify_pitch()` 测量每个渲染结果，偏差超过 50 音分就拒绝。实测准确率：
+  105 个键中 104 个在 100 音分以内。
+- **移调上限 3 个半音。** 再大的重采样会明显改变乐器：共振峰校正能把音体共振留在原位，但起音
+  瞬态和谐波平衡仍会移动，一个 pad 拉高五度听起来就像钟。超出窗口的键宁可留空，也不硬凑。
+- **每个键盘按自己的物理音域采样。** ELB-02 三个键盘音域不同——上/下键盘 49 键（C2–C6，
+  MIDI 36–84），脚键盘 20 键（C2–G3，MIDI 36–55）——所以 `build-sample-tones.py` 按键盘分别
+  构建乐器，只渲染真正能按到的键。这对脚键盘最关键：贝斯 stem 通常只弹 A1–D#2，**低于**脚键盘
+  自己的音域，所以脚键盘上半部分完全没有源素材。这些键由 SFZ 引擎移调最近的已渲染键
+  （`pitch_keycenter`）补足，这样采样保持在自己听起来仍像贝斯的音高，而不是被拉高一个八度。
+  脚键盘因此覆盖全部 20 个键。
 - 工程文件始终写在 `workspace\cantabile\` 内，**不会**写进 Cantabile 自己的用户目录。
 
 `import-cantabile.py` 生成工程后会询问：
@@ -269,6 +307,16 @@ Cantabile 的插件状态是 `base64(raw-deflate(aBMP(VST3 state)))`，
 `build-cantabile.py --self-test` 会用真实工程文件做逐字节往返校验，
 格式一旦变化会立刻失败。
 
+### 实时控制：Surge XT OSC 插件
+
+`surge-osc-plugin/` 是一个 DeepSeek Harness 工具包——即 `prompt.md` 中
+「Surge XT 音色复刻混合工作流」的执行层。它让 Agent 通过 Surge XT 原生 OSC
+接口设置（`surge_set_param`）与读回（`surge_get_param`）参数，零运行时依赖。
+在 DSH 的 **Plugins → Add plugin** 里选择该目录即可安装（或用
+`plugin_manager install_bundle`）；Surge 侧的 OSC 配置方法与查询限制
+（Surge 把查询回复发往它配置的 OSC 输出端口）见
+[surge-osc-plugin/README.md](surge-osc-plugin/README.md)。
+
 ### 工作区
 
 所有步骤共用一个工作区根目录，优先级：
@@ -279,8 +327,9 @@ Cantabile 的插件状态是 `base64(raw-deflate(aBMP(VST3 state)))`，
 4. 默认 `<项目根目录>\workspace`
 
 目录结构：`audio\`（下载）、`stems\`（分离结果）、`stems\<歌曲名>\refined\`（可选的二级细分）、
-`models\`（模型缓存）、`tone\`（音色文件）、`cantabile\`（Cantabile 工程）。
-`config.json` 记录本机路径，已在 `.gitignore` 中忽略。
+`models\`（模型权重）、`tone\`（音色文件）、`cantabile\`（Cantabile 工程）、
+`cache\`（工具缓存——torch / HuggingFace / numba / pip / yt-dlp 都被重定向到这里，
+不再写入用户目录）。`config.json` 记录本机路径，已在 `.gitignore` 中忽略。
 
 ### 模型选择
 
@@ -327,6 +376,7 @@ Cantabile 的插件状态是 `base64(raw-deflate(aBMP(VST3 state)))`，
 | `check-stems.py` | 逐窗口失效检测、每轨可用率 |
 | `refine-stems.py` | 专用二级细分（鼓 → 6 个部件） |
 | `analyze-tones.py` | 逐轨乐器/音色特点/角色分析 → JSON + MD 报告 |
+| `tone_design.py` | 特征驱动的 Surge XT 参数设计（单位换算 + 决策规则） |
 | `build-tones.py` | 生成 Surge XT 单乐器音色（`.fxp`；`--vstpreset` 可选） |
 | `build-sample-tones.py` | 从每条 stem 提取单音，生成 sforzando 采样音色（`.sfz` + `.wav`） |
 | `build-cantabile.py` | 生成 Cantabile 工程（`.cantabileSong`），按键盘分配 MIDI 通道 |
@@ -336,7 +386,8 @@ Cantabile 的插件状态是 `base64(raw-deflate(aBMP(VST3 state)))`，
 | `progress.py` | 阶段标头、实时百分比、心跳、失败报告 |
 | `align-model-config.py` | 修复 `chunk_size` 会导致分块器崩溃的模型配置 |
 | `setup-env.ps1` | 创建 `.venv`，安装 PyTorch 和两个推理后端 |
-| `common.ps1` | 工作区解析、`歌手 - 曲名` 命名工具 |
+| `common.ps1` | 工作区解析、`歌手 - 曲名` 命名工具、缓存重定向 |
+| `_cache_env.py` | 直接运行 python 脚本时把工具缓存重定向到 `<工作区>\cache` |
 
 ## 后续计划
 

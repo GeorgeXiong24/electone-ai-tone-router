@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Cpu
 )
 
@@ -7,6 +7,12 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $venv = Join-Path $root '.venv'
 $python = Join-Path $venv 'Scripts\python.exe'
+
+# Keep pip's download cache inside the project instead of the user profile.
+if (-not $env:PIP_CACHE_DIR) {
+    $env:PIP_CACHE_DIR = Join-Path $root 'workspace\cache\pip'
+}
+New-Item -ItemType Directory -Force -Path $env:PIP_CACHE_DIR | Out-Null
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     throw 'Git is required to install bs-roformer-infer.'
