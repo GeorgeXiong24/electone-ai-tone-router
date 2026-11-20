@@ -85,9 +85,13 @@ TEMPLATES = {
         "kind": "sfz", "plugin": "sforzando", "name28": "Grand Piano",
         # --surge-only swaps this for a Surge electric piano: Surge XT has no
         # acoustic grand, and the SFZ route needs the Salamander library.
+        # EP 1 is a *tine* electric piano: its oscillator is a sine-ish FM
+        # tine, so once the filter is closed it reads as a flute, not a piano.
+        # Soft Suitcase is the reed/tine EP with a fuller body and is the
+        # closest thing Surge has to a piano.
         "surge_alternative": {
-            "kind": "surge", "plugin": "surge-xt", "name28": "Electric Piano",
-            "source": ["Keys/EP 1.fxp"],
+            "kind": "surge", "plugin": "surge-xt", "name28": "Soft Suitcase",
+            "source": ["Keys/Soft Suitcase.fxp"],
         },
     },
     "贝斯": {
@@ -95,12 +99,16 @@ TEMPLATES = {
         "source": ["Basses/Fingered.fxp"],
     },
     "其他/混合": {
-        # `other` is the separator's residual bucket, but on this material its
-        # dominant content is bowed strings (slow 93 ms attacks, a 71 s
-        # sustained run, low spectral flatness). A pad preset smears that into
-        # a metallic buzz, so use the polyphonic string patch instead.
-        "kind": "surge", "plugin": "surge-xt", "name28": "String Ensemble",
-        "source": ["Polysynths/Violini Poly.fxp"],
+        # `other` is the separator's residual bucket. Its content is
+        # song-dependent, so the template must be a *neutral* sustained
+        # polyphonic patch: a lowpass-filtered ensemble that can pass for
+        # strings, pads or brass. Violini Poly was chosen before, but its
+        # filter is a notch (type 8) — retuning a notch from a spectral
+        # centroid does not open the sound, it just moves the notch and leaves
+        # a hollow, buzzing "electric" tone. Juno-60 Strings is a plain
+        # lowpass ensemble, so the feature-driven design can actually shape it.
+        "kind": "surge", "plugin": "surge-xt", "name28": "Juno Strings",
+        "source": ["Polysynths/Juno-60 Strings.fxp"],
     },
 }
 
@@ -235,6 +243,29 @@ def apply_param_design(xml, params):
     return xml, applied
 
 
+# Parameters the design reads back from the template so it can respect what the
+# sound designer already did (see tone_design.design_patch_params).
+TEMPLATE_PARAMS = (
+    "a_filter1_type", "a_filter1_cutoff", "a_filter1_envmod",
+    "a_filter1_resonance", "a_env1_attack", "a_env1_decay",
+    "a_env1_sustain", "a_env1_release",
+)
+
+
+def read_template_params(xml):
+    """Return the template's own values for TEMPLATE_PARAMS (natural units)."""
+    out = {}
+    for name in TEMPLATE_PARAMS:
+        m = re.search((rb'<%s\b[^>]*?value="([^"]*)"' % name.encode("ascii")), xml)
+        if not m:
+            continue
+        try:
+            out[name] = float(m.group(1))
+        except ValueError:
+            continue
+    return out
+
+
 # ---------------------------------------------------------------- sfz io
 
 SAMPLE_RE = re.compile(r"sample=(\S+)")
@@ -290,6 +321,34 @@ def safe_name(v):
     return re.sub(r'[\\/:*?"<>|]', "-", v).strip()
 
 
+def ascii_keyboard(keyboard):
+    """ASCII directory name for a keyboard.
+
+    ARIA decodes the whole .sfz path with the system code page, so the parent
+    directories have to be ASCII too — not just the filename.
+    """
+    return {"右手": "right", "左手": "left", "脚": "pedal"}.get(keyboard, "kb")
+
+
+def ascii_slug(text, max_len=48):
+    """A filesystem-safe ASCII slug for a name that may be CJK.
+
+    sforzando's ARIA engine decodes the .sfz path with the system code page
+    (GBK on a Chinese Windows), not UTF-8, so any CJK character in the path
+    becomes mojibake and the instrument silently loads nothing. The .sfz
+    filename therefore has to be pure ASCII; the readable name stays in the
+    SFZ comment and the manifest.
+    """
+    import hashlib
+
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-")
+    slug = re.sub(r"-{2,}", "-", slug)
+    if not slug:
+        slug = "tone"
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return f"{slug[:max_len]}-{digest}"
+
+
 def role_for_keyboard(stem, keyboard):
     """Most relevant role of this stem that maps to the given keyboard.
 
@@ -319,6 +378,10 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
     for stem_name, stem in stems.items():
         if stem.get("empty") or stem_name == "drums":
             continue
+        if stem.get("unusable"):
+            print(f"  skip {stem_name}: only {stem.get('activity', 0) * 100:.1f}% "
+                  f"audible after removing separation failures")
+            continue
         instrument = stem_name if stem_name in TEMPLATES else None
         # analysis labels stems in Chinese in the report; the JSON keeps the
         # wav basename, so map through the known set
@@ -337,9 +400,19 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
 
         for keyboard in stem.get("keyboards", []):
             role = role_for_keyboard(stem, keyboard)
-            plugin_dir = os.path.join(TONE_ROOT, keyboard, tpl["plugin"])
+            # Keyboard directories are ASCII for every plugin, so the tree has
+            # one shape and an .sfz path never contains a CJK segment (ARIA
+            # decodes the whole path with the system code page).
+            plugin_dir = os.path.join(TONE_ROOT, ascii_keyboard(keyboard),
+                                      tpl["plugin"])
             ext = "sfz" if tpl["kind"] == "sfz" else "fxp"
             fname = safe_name(f"{song} - {label}({role}).{ext}")
+            # sforzando's ARIA engine decodes the .sfz path with the system code
+            # page (GBK on a Chinese Windows), not UTF-8, so a CJK filename
+            # becomes mojibake and the instrument loads nothing. Surge .fxp
+            # files are read by Surge itself and keep the readable name.
+            if tpl["kind"] == "sfz":
+                fname = ascii_slug(f"{song} - {label}({role})") + ".sfz"
             out_path = os.path.join(plugin_dir, fname)
 
             # hard rule: outputs must stay inside the project workspace
@@ -357,11 +430,15 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
 
             # Feature-driven parameter design (tone_design.py): shapes the
             # template's filter/envelopes to the analyzed stem instead of only
-            # relabelling it. The audit trail lands in the manifest.
+            # relabelling it. The template's own values are passed in so the
+            # design can respect them (see tone_design.design_patch_params).
+            # The audit trail lands in the manifest.
             design = None
             applied = {}
             if use_param_design and tpl["kind"] == "surge":
-                design = tone_design.design_patch_params(stem)
+                _, tpl_xml, _ = read_fxp(tpl["resolved"])
+                tpl_params = read_template_params(tpl_xml)
+                design = tone_design.design_patch_params(stem, template=tpl_params)
                 if design["notes"]:
                     comment += (" | 参数设计：" + "；".join(
                         f"{n['param']}={n['value']:.3f}" for n in design["notes"]))
@@ -402,8 +479,13 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
                 _, xml, extra = read_fxp(tpl["resolved"])
                 if design and design["params"]:
                     xml, applied = apply_param_design(xml, design["params"])
+                    # Only parameters the design actually decided to write are
+                    # required to exist. A note that says "keep the template
+                    # value" (e.g. cutoff on a non-lowpass filter) is audit
+                    # trail, not a write.
                     missing = [n["param"] for n in design["notes"]
-                               if n["param"] not in applied]
+                               if n["param"] in design["params"]
+                               and n["param"] not in applied]
                     if missing:
                         raise RuntimeError(f"design params not found in preset: {missing}")
                     for n in design["notes"]:

@@ -243,6 +243,14 @@ these numbers mean.
   the `.fxp` (the template preset keeps its oscillator design). Every designed value and its
   reason is recorded in `tone\manifest.json` and the patch comment; `--no-param-design` falls
   back to plain template copying.
+  The design is **constrained by the template**, because a measurement is not a sound design:
+  - the cutoff may only move ±1.5 octaves from the template's own cutoff, so a dark stem cannot
+    drag a bright patch down into a muffled sine;
+  - a non-lowpass filter keeps its cutoff entirely — a notch has no "brightness" to open up;
+  - the template's filter env-mod is kept when it is at least half the designed value, preserving
+    the pluck/attack character that makes struck instruments sound struck;
+  - the measured attack has an 8 ms floor (onset detection fires after the rise, so it
+    under-reports), and a measured decay shorter than the tendency band's floor wins over the band.
 - Piano uses a sample-based source (sforzando + Accurate-Salamander grand piano SFZ); the SFZ
   config lives in the project and references the sample library by absolute path.
 - Surge tones are written as `.fxp` — Surge XT's native patch format, loadable by
@@ -286,12 +294,47 @@ assigns MIDI channels per keyboard, and writes `workspace\cantabile\<song>.canta
 | Lower (left hand) | 2 | chords / counter-melody / accompaniment |
 | Pedal (foot) | 3 | bass line |
 
-- **Only Surge XT tones are imported**: SFZ/sforzando tones are skipped (sampled SFZ does not
-  reproduce the source timbre well enough) and vocals get no tone file (the melody is played
-  live). Generate with `build-tones.py --surge-only --no-vocals`.
-- Surge XT has no acoustic grand, so the piano part uses a Surge electric piano (`Keys/EP 1.fxp`).
-- `other` (the residual bucket) joins as a **right-hand doubling layer** using the string patch
-  `Polysynths/Violini Poly.fxp`, labelled "pad" — it never claims the melody, it only adds body.
+- **A sampled instrument always wins over a synthesizer patch for the same part.** Surge XT is a
+  synthesizer: its factory presets are oscillator designs, so using one to imitate a recorded
+  guitar or bass produces a *different instrument* — a nylon-guitar preset reads as a plucked
+  zither, a fingered-bass preset reads as a muted trumpet. The stems themselves are the only
+  source that carries the recording's actual timbre, so when `build-sample-tones.py` has produced
+  an `.sfz` for a part, that is what gets imported and the Surge patch for the same part is
+  skipped. The piano is the exception in the other direction: always the Salamander grand.
+- **Sampled tone paths are pure ASCII.** sforzando's ARIA engine decodes the `.sfz` path with the
+  system code page (GBK on a Chinese Windows), not UTF-8, so a CJK path becomes mojibake
+  (`左手` → `宸︽墜`) and the plugin silently loads nothing. Keyboard directories are therefore
+  `right` / `left` / `pedal` and sampled instruments get an ASCII slug filename; the readable
+  Chinese name stays in the SFZ comment and the manifest. Surge `.fxp` files keep their Chinese
+  names because Surge reads them itself.
+- **One stem owns the right hand.** Several stems can carry a plausible top line, but the ELB-02
+  has one right hand. `analyze-tones.py` arbitrates: the stem with the strongest high-register
+  melody evidence keeps the right hand, the rest become counter-melody on the left. The residual
+  `other` bucket is a doubling layer and only takes the right hand when nothing else does.
+- **One left hand, one accompaniment instrument.** Two different instruments answering the same
+  key is not a layer, it is a collision: a pad and a piano chord struck together beat against each
+  other and read as a bell on one note and as jazz on two. The residual bucket is dropped from the
+  left hand when a real accompaniment stem already holds it, and the bass stem plays the pedal
+  only (doubling it on the left just muddies the chords).
+- **Every rendered sample is pitch-verified.** `render_note` transposes by `f_target / f0_src`, so
+  a source whose f0 was detected a fifth or an octave off makes every key a fixed interval wrong —
+  the instrument plays wrong intervals even though every file and region is valid. Two guards:
+  `refine_f0()` walks down the usual sub-harmonic ratios (÷2, ÷3, ÷1.5) and keeps the lowest
+  candidate that still has real spectral energy at its own fundamental, and `verify_pitch()`
+  measures each rendered note and rejects it when it lands more than 50 cents off. Measured
+  accuracy after both: 104 of 105 keys within 100 cents.
+- **Transposition is capped at 3 semitones.** Resampling further audibly changes the instrument —
+  the formant correction keeps body resonances in place, but the attack transient and harmonic
+  balance still move, and a pad stretched a fifth sounds like a bell. Keys outside the window stay
+  uncovered rather than faked.
+- **Each keyboard is sampled for its own physical range.** The ELB-02 has three keyboards with
+  different spans — Upper and Lower are 49 keys (C2–C6, MIDI 36–84), the Pedal is 20 keys
+  (C2–G3, MIDI 36–55) — so `build-sample-tones.py` builds one instrument per keyboard and only
+  renders keys that can actually be pressed. This matters most for the pedal: a bass stem
+  typically plays A1–D#2, which is *below* the pedal's own range, so the upper half of the pedal
+  has no source material at all. Those keys are filled by letting the SFZ engine transpose the
+  nearest rendered key (`pitch_keycenter`), which keeps the sample at a pitch where it still
+  sounds like a bass instead of stretching it an octave. The pedal therefore covers all 20 keys.
 - The song file always lives in `workspace\cantabile\`; nothing is written into Cantabile's own
   user folders.
 

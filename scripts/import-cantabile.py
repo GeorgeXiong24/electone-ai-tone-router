@@ -87,7 +87,7 @@ def build_song(song_filter=""):
 
 
 def verify_song(path):
-    """Check that every plugin blob in the song decodes to a Surge patch."""
+    """Check that every plugin blob in the song decodes to a usable state."""
     with open(path, encoding="utf-8") as f:
         song = json.load(f)
     plugins = 0
@@ -96,11 +96,16 @@ def verify_song(path):
             continue
         plugins += 1
         class_id, state = cf.decode_plugin_data(obj["pluginData"])
-        if class_id != cf.SURGE_CLASS_ID:
-            raise SystemExit(f"{obj['name']}: unexpected plugin class id")
-        xml, _ = cf.parse_surge_component_state(cf.parse_vst3_state(state)[1])
-        if b"<patch" not in xml[:200]:
-            raise SystemExit(f"{obj['name']}: state is not a Surge patch")
+        if class_id == cf.SURGE_CLASS_ID:
+            xml, _ = cf.parse_surge_component_state(cf.parse_vst3_state(state)[1])
+            if b"<patch" not in xml[:200]:
+                raise SystemExit(f"{obj['name']}: state is not a Surge patch")
+        elif class_id == cf.SFORZANDO_CLASS_ID:
+            sfz, _ = cf.parse_sforzando_component_state(cf.parse_vst3_state(state)[1])
+            if not os.path.isfile(sfz):
+                raise SystemExit(f"{obj['name']}: .sfz missing: {sfz}")
+        else:
+            raise SystemExit(f"{obj['name']}: unexpected plugin class id {class_id!r}")
     return plugins
 
 
