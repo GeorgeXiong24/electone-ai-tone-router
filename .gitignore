@@ -1,4 +1,5 @@
 .commandcode/
+.acl-recovery/
 tools/*.exe
 workspace/
 config.json
