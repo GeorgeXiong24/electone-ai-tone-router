@@ -21,6 +21,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _cache_env  # noqa: E402
+import tone_paths  # noqa: E402  (tone tree layout: song / keyboard / plugin)
 
 import numpy as np
 
@@ -152,7 +153,8 @@ def main():
         for entry in manifest[key]["files"]:
             if args.keyboard and entry["keyboard"] != args.keyboard:
                 continue
-            tones.append(os.path.join(WORKSPACE, "tone", entry["file"]))
+            tones.append(tone_paths.abs_from_song(
+                os.path.join(WORKSPACE, "tone"), key, entry["file"]))
 
     out_dir = args.out if args.out else os.path.join(WORKSPACE, "render")
     if len(tones) > 1 or not args.out.lower().endswith(".wav"):

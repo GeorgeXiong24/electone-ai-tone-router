@@ -32,6 +32,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cantabile_format as cf  # noqa: E402
+import tone_paths  # noqa: E402  (tone tree layout: song / keyboard / plugin)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.environ.get("ELECTONE_WORKSPACE") or os.path.join(ROOT, "workspace")
@@ -366,7 +367,7 @@ def output_port_object(unique_id):
 
 # ---------------------------------------------------------------- selection
 
-def collect_tones(song_entry):
+def collect_tones(song_entry, song=""):
     """Return the tones to import, one per (keyboard, instrument).
 
     A sampled instrument is always preferred over a synthesizer patch for the
@@ -402,7 +403,7 @@ def collect_tones(song_entry):
         if keyboard not in KEYBOARD_LAYOUT:
             skipped.append((rel, f"未知键盘 {keyboard}"))
             continue
-        tone_file = os.path.join(TONE_ROOT, rel)
+        tone_file = tone_paths.abs_from_song(TONE_ROOT, song, rel)
         if not os.path.isfile(tone_file):
             skipped.append((rel, "音色文件不存在"))
             continue
@@ -630,7 +631,7 @@ def main():
     print(f"song: {song}")
     print(f"tone dir: {TONE_ROOT}")
 
-    tones, skipped = collect_tones(entry)
+    tones, skipped = collect_tones(entry, song)
     for rel, why in skipped:
         print(f"  skip {rel}: {why}")
     if not tones:

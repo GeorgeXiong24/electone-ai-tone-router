@@ -231,11 +231,18 @@ these numbers mean.
 - `--exclude vocals,other` drops stems from the analysis. Excluding vocals leaves the piano's
   high register as the right-hand melody.
 - `build-tones.py` turns the analysis into **single-instrument** tone files under
-  `workspace\tone\<右手|左手|脚>\<plugin>\` — one file never mixes instruments. Right hand gets the
+  `workspace\tone\<song>\<右手|左手|脚>\<plugin>\` — one file never mixes instruments. Right hand gets the
   melody, left hand gets chords/counter-melody/accompaniment, the pedal gets the bass line;
   drums produce no tone file (the ELB-02 rhythm section covers them).
   When one stem feeds two keyboards, the filenames differ by role
   (e.g. `钢琴(主旋律)` vs `钢琴(和弦)`).
+- **The song directory is a pinyin ASCII slug** (e.g. `xiaomi-wozouhou-695243fd`), not the Chinese
+  title. Same reason the keyboard directories are `right`/`left`/`pedal`: ARIA decodes the whole
+  `.sfz` path with the system code page, so any CJK segment turns into mojibake and the instrument
+  silently loads nothing. `scripts/tone_paths.py` derives the name deterministically from the title
+  (pinyin plus the first 8 hex digits of its hash, so two titles that transliterate alike cannot
+  collide), which means a rebuild lands in the same directory. The readable title is kept in
+  `song.txt` inside the directory and as the manifest key.
 - **Surge tones are designed from the audio, not just relabelled.** `scripts/tone_design.py`
   maps the analyzed features onto Surge XT patch parameters — filter cutoff from the spectral
   centroid, filter env-mod from attack-vs-sustain brightness, amp/filter envelopes from the
@@ -272,7 +279,7 @@ these numbers mean.
   .\.venv\Scripts\python.exe .\scripts\build-sample-tones.py --latest
   ```
 
-  Output goes to `workspace\tone\<右手|左手|脚>\sforzando\`; `tone\sample-instruments.json`
+  Output goes to `workspace\tone\<song>\<右手|左手|脚>\sforzando\`; `tone\sample-instruments.json`
   records accepted/rejected note counts, velocity layers and keyboard coverage (keys
   without a usable source note are reported honestly, not stretched).
 - Nothing is ever written into a plugin's default/user patch folder — the scripts refuse
@@ -373,7 +380,9 @@ All stages share one workspace root, resolved in this order:
 4. Default: `<project>\workspace`
 
 Layout: `audio\` (downloads), `stems\` (separation output), `stems\<song>\refined\` (optional
-second-stage stems), `models\` (model weights), `tone\` (tone files), `cantabile\` (song files),
+second-stage stems), `models\` (model weights), `tone\<song>\<右手|左手|脚>\<plugin>\` (tone files;
+the song directory is a pinyin ASCII slug, see
+[Tone analysis & generation](#tone-analysis--generation)), `cantabile\` (song files),
 `cache\` (tool caches — torch / HuggingFace / numba / pip / yt-dlp are redirected here so
 nothing is written into the user profile). `config.json` holds machine-local paths and is
 gitignored.
@@ -430,6 +439,8 @@ automatically). Prefer the 6-stem model plus refinement.
 | `tone_design.py` | feature-driven Surge XT parameter design (unit conversions + decision rules) |
 | `build-tones.py` | single-instrument Surge XT tones (`.fxp`, optional `--vstpreset`) |
 | `build-sample-tones.py` | cut single notes from each stem → sforzando SFZ instrument (`.sfz` + `.wav`) |
+| `tone_paths.py` | tone tree layout: song pinyin slug / keyboard / plugin, plus manifest path helpers |
+| `migrate-tone-layout.py` | one-shot migration from `tone\<keyboard>\<plugin>\` to `tone\<song>\<keyboard>\<plugin>\` |
 | `build-cantabile.py` | generate a Cantabile song (`.cantabileSong`) with per-keyboard MIDI channels |
 | `import-cantabile.py` | build the song, then offer to open it in Cantabile |
 | `cantabile_format.py` | Cantabile plugin-state container (aBMP / VST3 state) ↔ `.fxp` |

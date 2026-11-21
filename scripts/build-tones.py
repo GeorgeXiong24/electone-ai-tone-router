@@ -50,6 +50,7 @@ import xml.etree.ElementTree as ET
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _cache_env  # noqa: E402  (redirect caches into the project workspace)
 import tone_design  # noqa: E402  (feature-driven Surge parameter design)
+import tone_paths  # noqa: E402  (tone tree layout: song / keyboard / plugin)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKSPACE = os.environ.get("ELECTONE_WORKSPACE") or os.path.join(ROOT, "workspace")
@@ -327,7 +328,7 @@ def ascii_keyboard(keyboard):
     ARIA decodes the whole .sfz path with the system code page, so the parent
     directories have to be ASCII too — not just the filename.
     """
-    return {"右手": "right", "左手": "left", "脚": "pedal"}.get(keyboard, "kb")
+    return tone_paths.ascii_keyboard(keyboard)
 
 
 def ascii_slug(text, max_len=48):
@@ -400,11 +401,11 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
 
         for keyboard in stem.get("keyboards", []):
             role = role_for_keyboard(stem, keyboard)
-            # Keyboard directories are ASCII for every plugin, so the tree has
-            # one shape and an .sfz path never contains a CJK segment (ARIA
-            # decodes the whole path with the system code page).
-            plugin_dir = os.path.join(TONE_ROOT, ascii_keyboard(keyboard),
-                                      tpl["plugin"])
+            # Layout is <tone>/<song>/<keyboard>/<plugin>/. The song directory
+            # is a pinyin slug because ARIA decodes the whole .sfz path with
+            # the system code page, so a CJK segment would break sforzando.
+            plugin_dir = tone_paths.plugin_dir(TONE_ROOT, song, keyboard,
+                                               tpl["plugin"])
             ext = "sfz" if tpl["kind"] == "sfz" else "fxp"
             fname = safe_name(f"{song} - {label}({role}).{ext}")
             # sforzando's ARIA engine decodes the .sfz path with the system code
@@ -445,7 +446,7 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
             print(f"  {keyboard}/{tpl['plugin']}/{fname}")
 
             if dry_run:
-                entry = {"file": os.path.relpath(out_path, TONE_ROOT),
+                entry = {"file": tone_paths.rel_to_song(TONE_ROOT, song, out_path),
                          "keyboard": keyboard, "plugin": tpl["plugin"],
                          "instrument": label, "role": role, "dry_run": True}
                 if design:
@@ -470,7 +471,7 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
                     raise RuntimeError(f"{len(missing)} sample paths missing, "
                                        f"e.g. {missing[0]}")
                 entries.append({
-                    "file": os.path.relpath(out_path, TONE_ROOT),
+                    "file": tone_paths.rel_to_song(TONE_ROOT, song, out_path),
                     "keyboard": keyboard, "plugin": tpl["plugin"],
                     "instrument": label, "role": role,
                     "source": tpl["resolved"], "samples": len(samples),
@@ -510,7 +511,7 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
                         raise RuntimeError(f"vstpreset round-trip mismatch: {vst_path}")
 
                 entry = {
-                    "file": os.path.relpath(out_path, TONE_ROOT),
+                    "file": tone_paths.rel_to_song(TONE_ROOT, song, out_path),
                     "keyboard": keyboard, "plugin": tpl["plugin"],
                     "instrument": label, "role": role,
                     "source": tpl["resolved"],
@@ -524,7 +525,8 @@ def build_song(song, stems, dry_run=False, vstpreset=False, surge_only=False,
                         "applied": True,
                     }
                 if vst_path:
-                    entry["vstpreset"] = os.path.relpath(vst_path, TONE_ROOT)
+                    entry["vstpreset"] = tone_paths.rel_to_song(
+                        TONE_ROOT, song, vst_path)
                 entries.append(entry)
     return entries
 
@@ -580,6 +582,9 @@ def main():
 
     if not args.dry_run:
         os.makedirs(TONE_ROOT, exist_ok=True)
+        # The directory name is a pinyin slug; keep the readable title next to
+        # the files so the tree stays legible.
+        tone_paths.write_song_title(TONE_ROOT, song)
         manifest_path = os.path.join(TONE_ROOT, "manifest.json")
         manifest = {}
         if os.path.isfile(manifest_path):
@@ -588,6 +593,8 @@ def main():
         manifest[song] = {
             "generated": datetime.datetime.now().isoformat(timespec="seconds"),
             "analysis": os.path.relpath(analysis_path, WORKSPACE),
+            # Paths in `files` are relative to this directory, not to tone/.
+            "tone_dir": tone_paths.song_slug(song),
             "how_to_load": {
                 "surge_xt": "Drag the .fxp file onto the Surge XT window "
                             "(Surge accepts .fxp by drag-and-drop).",

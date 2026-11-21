@@ -284,23 +284,44 @@ def analyze_stem(path, quick=False, exclude_mask=None):
     return feats
 
 
-def analyze_melody_register(y, sr, hop, active, split_hz=262.0):
+def analyze_melody_register(y, sr, hop, active, split_hz=262.0,
+                            min_high_band_share=0.15):
     """Track the melody line above `split_hz` (default C4).
 
     Returns a dict describing whether a usable monophonic line exists up
     there, or None when the stem has no high-register content.
+
+    `min_high_band_share` rejects stems whose only energy above the split is
+    harmonic spill from a low fundamental (see the measurement table below).
     """
     import scipy.signal
 
     sos = scipy.signal.butter(4, split_hz / (sr / 2), "highpass", output="sos")
     y_hi = scipy.signal.sosfiltfilt(sos, y)
 
+    share = float(np.sum(y_hi ** 2)) / (float(np.sum(y ** 2)) + 1e-12)
     # A high-passed bass stem still has harmonics up there, and pyin happily
-    # locks onto them. Require the high band to carry real energy relative to
-    # the whole stem before believing any of it.
-    band_energy = float(np.sum(y_hi ** 2))
-    total_energy = float(np.sum(y ** 2)) + 1e-12
-    if band_energy / total_energy < 0.05:
+    # locks onto them: a ~73 Hz fundamental carries real energy above C4 in its
+    # 3rd and 4th harmonics, so a plain 5% threshold lets a *bass line* look
+    # like a melody. The threshold has to be well above that, and the measured
+    # separation is wide enough to place it safely:
+    #
+    #   stem                 high_band_share
+    #   bass (《女孩》)               0.052   <- harmonics only
+    #   guitar (《我走后》)          0.577
+    #   guitar (《女孩》)            0.695
+    #   piano (《蒲公英》)           0.748
+    #   other (《女孩》)             0.834
+    #
+    # 0.15 sits in the empty band between "a sliver of harmonic energy" and "a
+    # voice that actually lives up there", so it rejects the bass without
+    # touching any genuine melody carrier.
+    #
+    # A register gate was tried here and rejected by measurement: the guitar on
+    # 《女孩》 tracks its line ~2.1 octaves above the stem's own (chord) register,
+    # which is simply how a guitar's top strings relate to its low ones. Any
+    # threshold tight enough to catch the bass also killed that real melody.
+    if share < min_high_band_share:
         return None
 
     f0, voiced, _ = librosa.pyin(
@@ -312,6 +333,8 @@ def analyze_melody_register(y, sr, hop, active, split_hz=262.0):
 
     f0_v = f0[voiced]
     midi = librosa.hz_to_midi(f0_v)
+    register = float(np.median(midi))
+
     # Step sizes: a melody moves mostly by small intervals, a chord
     # progression jumps around. This separates the two.
     steps = np.abs(np.diff(librosa.hz_to_midi(f0)))
@@ -320,11 +343,11 @@ def analyze_melody_register(y, sr, hop, active, split_hz=262.0):
 
     return {
         "voiced_ratio": round(float(voiced.mean()), 3),
-        "register_midi": round(float(np.median(midi)), 1),
+        "register_midi": round(register, 1),
         "range_midi": [round(float(np.percentile(midi, 10)), 1),
                        round(float(np.percentile(midi, 90)), 1)],
         "step_lt2_semitones": round(smooth, 3),
-        "high_band_share": round(band_energy / total_energy, 3),
+        "high_band_share": round(share, 3),
         "is_melodic": bool(voiced.mean() > 0.5 and smooth > 0.85),
     }
 
@@ -639,8 +662,27 @@ def arbitrate_melody(stems):
                 * float(mel.get("step_lt2_semitones", 0))
                 * float(mel.get("high_band_share", 0)))
 
+    # The bass stem is the pedal part, full stop. `assign_roles` already pins
+    # its keyboards to ["脚"], but that assignment happens *before* arbitration
+    # and the melody promotion above it can hand the bass a right hand anyway
+    # when its high-passed harmonics look melodic. A bass line on the upper
+    # manual is never the intended arrangement: it is the low end played an
+    # octave or two up, which reads as a muddy doubling of the pedal and, on
+    # this song, displaced the guitar — the actual melody — off the right hand.
+    bass = stems.get("bass")
+    if bass and not bass.get("unusable"):
+        bass["keyboards"] = ["脚"]
+        bass["melody_keyboard"] = "脚"
+        mel = bass.get("melody") or {}
+        if mel.get("is_melodic"):
+            bass["melody_rejected_because"] = "贝斯只走脚键盘，高频段是泛音而非旋律"
+            mel["is_melodic"] = False
+            bass["melody"] = mel
+
     claimants = [n for n, s in stems.items()
-                 if s.get("primary_role") == ROLE_MELODY and not s.get("unusable")]
+                 if s.get("primary_role") == ROLE_MELODY
+                 and not s.get("unusable")
+                 and "右手" in s.get("keyboards", [])]
     winner = None
     if len(claimants) > 1:
         claimants.sort(key=lambda n: strength(stems[n]), reverse=True)
