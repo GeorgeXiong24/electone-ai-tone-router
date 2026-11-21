@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Position = 0)]
     [string]$Song,
     [string]$Workspace,
@@ -123,9 +123,16 @@ if ($latest -and -not $NoSeparate) {
             Write-Host ('=' * 64)
             & $python (Join-Path $PSScriptRoot 'analyze-tones.py') --song $name --exclude 'vocals'
             if ($LASTEXITCODE -eq 0) {
-                # Surge XT only: SFZ tones do not reproduce the source timbre,
-                # and the melody is played live so vocals get no tone file.
-                & $python (Join-Path $PSScriptRoot 'build-tones.py') --song $name --surge-only --no-vocals
+                # Stem-sampled instruments first. They carry the recording's
+                # actual timbre, and build-cantabile.py always prefers them over
+                # the Surge patch for the same part (see its collect_tones).
+                # Without this step the one-shot pipeline produced synthesizer
+                # presets only, so what a user got from download-audio.cmd was
+                # not the same instrument set a manual run produced.
+                & $python (Join-Path $PSScriptRoot 'build-sample-tones.py') --song $name
+                # Surge patches: the fallback for parts with no usable samples,
+                # and the piano (which always uses the Salamander .sfz).
+                & $python (Join-Path $PSScriptRoot 'build-tones.py') --song $name --no-vocals
             }
             if ($LASTEXITCODE -eq 0 -and -not $NoCantabile) {
                 & $python (Join-Path $PSScriptRoot 'import-cantabile.py') --song $name

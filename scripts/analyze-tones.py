@@ -88,7 +88,19 @@ CHORD_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 # Analysis sample rate / hop. Fixed here so a frame mask computed outside
 # analyze_stem() lines up with the frames it uses internally.
-SR = 22050
+#
+# 22050 Hz is a deliberate trade (half the FFT work), but it was a silent
+# mismatch: build-sample-tones.py samples at CFG["sr"] = 44100, so every
+# frequency-valued feature this script records was measured on a band that
+# stops at 11 kHz while the sampler worked with 22 kHz. Spectral centroid,
+# rolloff and brightness_attack/sustain are all absolute Hz numbers, and they
+# are written straight into the patch comment and into tone_design's decisions,
+# so the two halves of the pipeline were describing different signals.
+#
+# They are now the same rate. The cost is roughly 2x the analysis time; the
+# benefit is that "谱质心 1807Hz" means the same thing to the analyst, the
+# designer and the evaluator.
+SR = 44100
 HOP = 512
 
 # A window where the residual `other` stem is a copy of the mix is a
@@ -182,7 +194,7 @@ def analyze_stem(path, quick=False, exclude_mask=None):
     `exclude_mask` marks frames that must not contribute to any statistic
     (dumped separation windows); they are treated as silence.
     """
-    y, sr = librosa.load(path, sr=22050, mono=True)
+    y, sr = librosa.load(path, sr=SR, mono=True)
     if len(y) == 0:
         return {"empty": True}
 

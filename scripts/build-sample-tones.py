@@ -1144,12 +1144,27 @@ def write_instrument(song, label, role, keyboard, built, TONE_root):
               f"({reachable[0]}..{reachable[-1]}, cap {fill_cap} semitones)")
     if unreachable:
         # Honest gap: no source material and transposing one would be faking it.
+        # Printed *and* returned, because a gap that only exists in scrollback is
+        # a gap nobody acts on: what decides whether a tone is usable for a
+        # piece is the manifest, and the earlier version left it out of the file.
         print(f"    {len(unreachable)} key(s) left empty, no source within "
               f"{fill_cap} semitones: {unreachable[0]}..{unreachable[-1]}")
 
     with open(sfz_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    return sfz_path, sample_dir
+    total_keys = key_hi - key_lo + 1
+    coverage = {
+        "keyboard_range": [key_lo, key_hi],
+        "keys_total": total_keys,
+        "keys_rendered": len(covered),
+        "keys_gap_filled": len(reachable),
+        "keys_empty": len(unreachable),
+        "empty_keys": unreachable,
+        "gap_fill_cap_semitones": fill_cap,
+        "coverage_pct": round(100.0 * (len(covered) + len(reachable))
+                              / max(total_keys, 1), 1),
+    }
+    return sfz_path, sample_dir, coverage
 
 
 # ---------------------------------------------------------------- song build
@@ -1233,7 +1248,7 @@ def build_song(song, stems, stems_dir, dry_run=False):
                                 "notes": len(built["notes"])})
                 print(f"    [dry-run] {keyboard}/sforzando/{safe_name(song + ' - ' + label)}.sfz")
                 continue
-            sfz_path, sample_dir = write_instrument(
+            sfz_path, sample_dir, coverage = write_instrument(
                 song, label, role, keyboard, built, TONE_ROOT)
             print(f"    {tone_paths.rel_to_song(TONE_ROOT, song, sfz_path)}")
             entries.append({
@@ -1246,6 +1261,7 @@ def build_song(song, stems, stems_dir, dry_run=False):
                 "layer_centroids_db": [round(c, 1) for c in built["centroids_db"]],
                 "keys_covered": n_keys,
                 "key_range": [built["keys"][0], built["keys"][-1]] if n_keys else [],
+                "coverage": coverage,
                 "looped_samples": built["looped"],
                 "filled_layer_gaps": built.get("filled_gaps", 0),
                 "max_source_shift_cents": round(built["max_shift_cents"], 1),

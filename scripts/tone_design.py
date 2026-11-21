@@ -52,8 +52,26 @@ CFG = {
     "fallback_fundamental_hz": 220.0,
     # A lowpass below the note's fundamental removes the note itself: the bass
     # patch designed at 65 Hz rendered at -50 dB with a 21 Hz centroid, because
-    # the fundamental (41-98 Hz for E1-G2) sat above the cutoff. Never design a
-    # cutoff below this multiple of the stem's own register.
+    # the fundamental (41-98 Hz for E1-G2) sat above the cutoff.
+    #
+    # 1.5x was not enough, and the measurement is unambiguous. On the *Fingered*
+    # template (LP 24 dB) transposed to a 74 Hz fundamental, the rendered peak
+    # against cutoff was:
+    #
+    #   cutoff   111 Hz (1.5x)  -> peak 0.0000   inaudible
+    #            222 Hz (3x)    -> peak 0.0004   inaudible
+    #            444 Hz (6x)    -> peak 0.0043   inaudible
+    #            592 Hz (8x)    -> peak 0.0323   audible
+    #            740 Hz (10x)   -> peak 0.0700
+    #           1110 Hz (15x)   -> peak 0.2260
+    #           2220 Hz (30x)   -> peak 0.6636   (the template's own cutoff)
+    #
+    # A 24 dB/oct lowpass needs several octaves above the fundamental before the
+    # harmonics that carry a bass note's loudness survive. The floor is therefore
+    # expressed in octaves above the fundamental, not as a small multiple.
+    "cutoff_floor_octaves_above_fundamental": 3.0,   # 8x = 3 octaves
+    # Kept for backwards compatibility with any older analysis.json; the octaves
+    # rule above supersedes it and is applied after it.
     "cutoff_floor_vs_fundamental": 1.5,
     # How far the designed cutoff may move away from the template's own cutoff,
     # in octaves. The template was voiced by a sound designer, so the
@@ -302,20 +320,19 @@ def design_patch_params(feats, template=None):
         reason = (f"相对亮度 {relative:.2f}×（谱质心 {float(brightness):.0f}Hz / "
                   f"{basis}）÷ 0.18 → 低通 {fc:.0f}Hz"
                   f"（{12 * math.log2(fc / 440):.2f} 半音 @A4）")
-        # Never put the cutoff under the note's own fundamental: a lowpass below
-        # it removes the note instead of shaping it.
-        floor_hz = fundamental * CFG["cutoff_floor_vs_fundamental"]
-        if fc < floor_hz:
-            reason += (f"；下限 {CFG['cutoff_floor_vs_fundamental']:.1f}× 基频 "
-                       f"→ {floor_hz:.0f}Hz")
-            fc = floor_hz
-        # And never open it so far that the oscillator's noise dominates.
-        ceil_hz = fundamental * CFG["cutoff_ceiling_vs_fundamental"]
-        if fc > ceil_hz:
-            reason += (f"；上限 {CFG['cutoff_ceiling_vs_fundamental']:.0f}× 基频 "
-                       f"→ {ceil_hz:.0f}Hz（再高会放出振荡器噪声）")
-            fc = ceil_hz
         v = hz_to_cutoff_value(fc)
+
+        # Order matters, and getting it wrong silenced every bass patch.
+        #
+        # The template constraint runs FIRST. Fender/template bass patches sit at
+        # cutoff -51 semitones (13.75 Hz); clamping the *design* to ±3 octaves of
+        # that gives -15 semitones = 185 Hz. Applying that clamp last (as this
+        # code used to) then *overrode* the fundamental floor, and a 185 Hz
+        # lowpass on a note whose fundamental is 74 Hz removes the note itself:
+        # measured peak 0.0004 against 0.114 for the untouched template, i.e. a
+        # silent instrument. The clamp is a soft "do not stray too far from the
+        # sound designer's intent" rule; the fundamental floor is a hard "do not
+        # delete the note" rule, so the hard rule has to win.
         if tpl_cutoff is not None:
             lo = tpl_cutoff - CFG["cutoff_max_shift_octaves"] * 12.0
             hi = tpl_cutoff + CFG["cutoff_max_shift_octaves"] * 12.0
@@ -324,8 +341,31 @@ def design_patch_params(feats, template=None):
                 reason += (f"；模板 cutoff {tpl_cutoff:.1f} 半音，限制在 ±"
                            f"{CFG['cutoff_max_shift_octaves']:.1f} 八度内 → {clamped:.1f}")
                 v = clamped
+
+        # Hard floor: never put the cutoff under the note's own fundamental, or
+        # the filter removes the note instead of shaping it. Two floors apply —
+        # a small multiple (legacy) and, because a 24 dB/oct lowpass needs
+        # several octaves of headroom before a bass is audible at all, an
+        # octave-based floor that dominates in practice (see CFG).
+        floor_hz = max(fundamental * CFG["cutoff_floor_vs_fundamental"],
+                       fundamental * 2.0
+                       ** CFG["cutoff_floor_octaves_above_fundamental"])
+        if cutoff_value_to_hz(v) < floor_hz:
+            reason += (f"；下限 {2.0 ** CFG['cutoff_floor_octaves_above_fundamental']:.0f}×"
+                       f" 基频 → {floor_hz:.0f}Hz"
+                       f"（24dB/oct 低通在此以下会把音符本身滤掉，实测 111Hz 时峰值为 0）")
+            v = hz_to_cutoff_value(floor_hz)
+
+        # And never open it so far that the oscillator's own noise dominates.
+        ceil_hz = fundamental * CFG["cutoff_ceiling_vs_fundamental"]
+        if cutoff_value_to_hz(v) > ceil_hz:
+            reason += (f"；上限 {CFG['cutoff_ceiling_vs_fundamental']:.0f}× 基频 → "
+                       f"{ceil_hz:.0f}Hz（再高会放出振荡器噪声）")
+            v = hz_to_cutoff_value(ceil_hz)
+
         params["a_filter1_cutoff"] = v
         used["brightness_hz"] = brightness
+        used["cutoff_hz"] = round(cutoff_value_to_hz(v), 1)
         notes.append(_note("a_filter1_cutoff", v, reason))
     elif brightness and filter_type is not None:
         notes.append(_note(

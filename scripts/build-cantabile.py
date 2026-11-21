@@ -589,6 +589,26 @@ def load_song_entry(song):
     return entry
 
 
+def prune_stale(entry, song):
+    """Drop manifest entries whose tone files no longer exist on disk.
+
+    Both manifests accumulate entries for songs whose tone directory was
+    deleted or never rebuilt (《不能說的祕密》 has audio and a manifest entry but
+    no stems, so its referenced .sfz/.fxp paths are all gone). Left in place,
+    they make build-cantabile pick a song whose every file is missing, and the
+    error surfaces much later as "no tones to import" with no explanation.
+    """
+    kept, dropped = [], []
+    for e in entry.get("files", []):
+        rel = e.get("file") or e.get("sfz") or ""
+        if rel and os.path.isfile(tone_paths.abs_from_song(TONE_ROOT, song, rel)):
+            kept.append(e)
+        else:
+            dropped.append(rel)
+    entry["files"] = kept
+    return entry, dropped
+
+
 def pick_song(args):
     manifest_path = os.path.join(TONE_ROOT, "manifest.json")
     if not os.path.isfile(manifest_path):
@@ -596,16 +616,29 @@ def pick_song(args):
     with open(manifest_path, encoding="utf-8") as f:
         manifest = json.load(f)
 
+    # A manifest entry is not a promise that the files are still there. Only
+    # consider songs that still have at least one tone file on disk.
+    alive = {}
+    for name in manifest:
+        entry, _ = prune_stale(load_song_entry(name), name)
+        if entry["files"]:
+            alive[name] = manifest[name]
+    if not alive:
+        sys.exit(f"no song in {manifest_path} has any tone file on disk - "
+                 f"run build-tones.py / build-sample-tones.py first")
     if args.song:
-        matches = [k for k in manifest if args.song in k]
+        matches = [k for k in alive if args.song in k]
         if not matches:
-            sys.exit(f"no song matching {args.song!r} in {manifest_path}")
+            sys.exit(f"no song with existing tone files matching {args.song!r}")
         song = matches[0]
-    elif not manifest:
+    elif not alive:
         sys.exit(f"manifest is empty: {manifest_path}")
     else:
-        song = max(manifest, key=lambda k: manifest[k].get("generated", ""))
-    return song, load_song_entry(song)
+        song = max(alive, key=lambda k: alive[k].get("generated", ""))
+    entry, dropped = prune_stale(load_song_entry(song), song)
+    for rel in dropped:
+        print(f"  stale: {rel} (file no longer exists, skipped)")
+    return song, entry
 
 
 def main():
