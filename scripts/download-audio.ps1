@@ -4,7 +4,9 @@
     [string]$Workspace,
     [string]$OutDir,
     [string]$CookiesFromBrowser,
-    [switch]$NoSeparate
+    [switch]$NoSeparate,
+    [switch]$NoTones,
+    [switch]$NoCantabile
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -53,6 +55,7 @@ if ($Song -match '^https?://') {
 $arguments = @(
     $target
     '--no-playlist'
+    '--cache-dir', (Join-Path (Get-ElectoneCacheRoot) 'yt-dlp')
     '--ffmpeg-location', $toolsDir
     '-x'
     '--audio-format', 'wav'
@@ -109,4 +112,31 @@ if ($latest -and -not $NoSeparate) {
     $env:ELECTONE_STAGE_OFFSET = '1'
     & (Join-Path $PSScriptRoot 'separate-stems.ps1') -AudioFile $latest.FullName -Workspace $root
     Remove-Item Env:\ELECTONE_STAGE_OFFSET -ErrorAction SilentlyContinue
+
+    if (-not $NoTones) {
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($latest.FullName)
+        $python = Join-Path $script:ElectoneRepoRoot '.venv\Scripts\python.exe'
+        if (Test-Path $python) {
+            Write-Host ''
+            Write-Host ('=' * 64)
+            Write-Host '[3/3] 音色分析与生成 / analyzing and building tones'
+            Write-Host ('=' * 64)
+            & $python (Join-Path $PSScriptRoot 'analyze-tones.py') --song $name --exclude 'vocals'
+            if ($LASTEXITCODE -eq 0) {
+                # Stem-sampled instruments first. They carry the recording's
+                # actual timbre, and build-cantabile.py always prefers them over
+                # the Surge patch for the same part (see its collect_tones).
+                # Without this step the one-shot pipeline produced synthesizer
+                # presets only, so what a user got from download-audio.cmd was
+                # not the same instrument set a manual run produced.
+                & $python (Join-Path $PSScriptRoot 'build-sample-tones.py') --song $name
+                # Surge patches: the fallback for parts with no usable samples,
+                # and the piano (which always uses the Salamander .sfz).
+                & $python (Join-Path $PSScriptRoot 'build-tones.py') --song $name --no-vocals
+            }
+            if ($LASTEXITCODE -eq 0 -and -not $NoCantabile) {
+                & $python (Join-Path $PSScriptRoot 'import-cantabile.py') --song $name
+            }
+        }
+    }
 }

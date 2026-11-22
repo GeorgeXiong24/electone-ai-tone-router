@@ -1,7 +1,14 @@
 .commandcode/
+.acl-recovery/
 tools/*.exe
 workspace/
 config.json
 .venv/
 __pycache__/
 *.pyc
+reference.md
+prompt.md
+.env
+.env.*
+!.env.example
+node_modules/
