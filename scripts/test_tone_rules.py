@@ -183,6 +183,152 @@ def test_eval_constants_are_documented_bounds():
     check("null-test pass is -60 dBFS", te.NULL_TEST_PASS_DB == -60.0)
 
 
+# ------------------------------------------------------- timbre consistency
+
+def test_timbre_consistency_rules():
+    """A sampled instrument must be one instrument across the keyboard.
+
+    History: the right hand of 《女孩》 sounded like a classical guitar on some
+    keys, a muted electric guitar on others and a bass on others. Measured in
+    the rendered samples before the rules existed:
+
+        relative brightness (centroid/f0): 2.03 (k63) .. 36.09 (k36), 17.7x
+        HF/LF ratio:                      0.075 (k63) .. 1.29 (k59), 17x
+        adjacent keys jumped up to 142% in relative brightness
+        polyphony test on k55/k63/k70: 9/11/12 foreign spectral peaks
+
+    `score` could not catch it: it rewards clean segments, and a clean bass note
+    is still a bass note. The fix ranks and gates takes on timbre as well, using
+    measures that are pitch-invariant so a genuinely darker low note survives.
+    """
+    print("\n[timbre] one instrument across the keyboard")
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "bst_timbre_under_test",
+        os.path.join(ROOT, "scripts", "build-sample-tones.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    cfg = mod.CFG
+
+    # The gates must sit in the measured gap between a clean note and a
+    # contaminated one, not at a round number picked by feel.
+    check("sub-peak gate rejects only an unambiguous second voice "
+          "(peak under f0 >= peak at f0)",
+          cfg["max_sub_peak_ratio"] == 1.0,
+          f"got {cfg['max_sub_peak_ratio']}")
+    check("a ranking penalty handles the ambiguous 0.5-1.0 band instead",
+          cfg.get("w_sub_peak", 0) > 0)
+    check("no gate exists on harmonic concentration, which never fires "
+          "on this material (measured min 1.12)",
+          "min_harmonic_concentration" not in cfg)
+
+    # Pre-rendering still keeps the engine stretch small, but it is no longer a
+    # reason to leave a key silent: the SFZ fills any remaining key by
+    # transposition (see test_every_key_sounds). What matters here is that the
+    # *preferred* window stays tight enough to sound like the instrument.
+    check("preferred pre-render window stays within 2 semitones",
+          cfg["max_shift_semitones"] <= 2.0,
+          f"got {cfg['max_shift_semitones']}")
+    check("the pedal keeps its documented wider exception",
+          cfg["max_shift_semitones_by_keyboard"].get("脚") == 5.0)
+
+    # timbre_trend must recover a known slope and reject outliers as residual,
+    # without letting the outliers bend the line they are measured against.
+    def note(midi, rel, sub=0.05):
+        return {"midi": midi,
+                "timbre": {"brightness_rel": rel, "sub_peak_ratio": sub}}
+
+    # A single instrument whose brightness falls ~0.04 oct per semitone, with
+    # three takes from a much darker instrument mixed in.
+    honest = [note(m, 2.0 ** (2.0 - 0.04 * (m - 50))) for m in range(40, 61)]
+    outliers = [note(45, 0.02), note(52, 0.03), note(58, 0.05)]
+    trend = mod.timbre_trend(honest + outliers, cfg)
+    check("a trend is fitted once there is enough material", trend is not None)
+    if trend is not None:
+        check(f"fitted slope {-0.04:.3f} oct/semitone is recovered "
+              f"(got {trend[0]:.3f})", abs(trend[0] - (-0.04)) < 0.01)
+        worst_honest = max(abs(mod.timbre_deviation(n, trend)) for n in honest)
+        check("honest takes sit on the fitted trend",
+              worst_honest <= cfg["timbre_trend_tolerance_oct"] * 0.5,
+              f"worst {worst_honest:.2f} oct")
+        devs = [abs(mod.timbre_deviation(n, trend)) for n in outliers]
+        check("foreign takes fall outside the tolerance",
+              min(devs) > cfg["timbre_trend_tolerance_oct"],
+              f"least-bad outlier {min(devs):.2f} oct")
+
+    # Too little material must not invent a trend.
+    check("no trend is fitted from a handful of notes",
+          mod.timbre_trend(honest[:3], cfg) is None)
+
+    # pick_takes must prefer the on-trend take even when the off-trend one is
+    # marginally cleaner. This is the exact trade the old code got wrong.
+    trend = mod.timbre_trend(honest, cfg)
+    on_trend = note(50, 2.0 ** 2.0)
+    on_trend.update(score=0.80, layer=2, f0_hz=100.0, audio=None)
+    off_trend = note(50, 2.0 ** 1.0)          # +1 octave: a different voice
+    off_trend.update(score=0.86, layer=2, f0_hz=100.0, audio=None)
+    picked = mod.pick_takes([on_trend, off_trend], cfg, trend)
+    check("the consistent take wins over a slightly cleaner foreign one",
+          len(picked) == 1 and picked[0]["score"] == 0.80,
+          f"picked score {picked[0]['score'] if picked else None}")
+
+
+# ------------------------------------------------------ full keyboard coverage
+
+def test_every_key_sounds():
+    """Every key on the hardware keyboard must produce a sound.
+
+    History: the engine-transposition fallback was capped and keys beyond the
+    cap got no `<region>` at all. The SFZ showed them greyed out and pressing
+    them did nothing — most of the guitar's upper manual (MIDI 71..84) was dead.
+    A stretched sample still plays the right note; a missing region plays
+    nothing, so playability wins over timbre purity.
+    """
+    print("\n[coverage] every key on the keyboard sounds")
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "bst_coverage_under_test",
+        os.path.join(ROOT, "scripts", "build-sample-tones.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    cfg = mod.CFG
+
+    check("full-keyboard coverage is enabled by default",
+          cfg.get("always_cover_keyboard") is True)
+
+    # The hardware ranges the SFZ must cover, and the widest a single take may
+    # be stretched before the manifest labels that key 'extrapolated'.
+    check("both manuals cover MIDI 36..84 (49 keys each)",
+          cfg["keyboard_ranges"]["右手"] == (36, 84)
+          and cfg["keyboard_ranges"]["左手"] == (36, 84))
+    check("the pedal covers MIDI 36..55 (20 keys)",
+          cfg["keyboard_ranges"]["脚"] == (36, 55))
+    for kb, (lo, hi) in cfg["keyboard_ranges"].items():
+        check(f"{kb}: the covered range is contiguous ({lo}..{hi})",
+              hi - lo + 1 == len(range(lo, hi + 1)))
+
+    # A key far outside the available takes must still be assigned the nearest
+    # one. This mirrors build_instrument's extrapolation step.
+    takes = [{"midi": 60, "f0_hz": mod_f_hz(60)},
+             {"midi": 62, "f0_hz": mod_f_hz(62)}]
+    key_lo, key_hi = cfg["keyboard_ranges"]["右手"]
+    assigned = {}
+    for k in range(key_lo, key_hi + 1):
+        src = min(takes, key=lambda t: abs(1200.0 * math.log2(
+            mod_f_hz(k) / t["f0_hz"])))
+        assigned[k] = src["midi"]
+    check("every key 36..84 gets a source take, even far outside its pitch",
+          len(assigned) == 49 and all(v is not None for v in assigned.values()))
+    check("a key an octave above the only nearby take still gets one",
+          assigned.get(84) is not None)
+
+
+def mod_f_hz(midi):
+    return 440.0 * 2.0 ** ((float(midi) - 69.0) / 12.0)
+
+
 def main():
     test_cutoff_never_below_audible_floor()
     test_bright_instrument_keeps_its_top_end()
@@ -191,6 +337,8 @@ def main():
     test_cutoff_hz_roundtrip()
     test_analysis_and_sampler_share_a_rate()
     test_eval_constants_are_documented_bounds()
+    test_timbre_consistency_rules()
+    test_every_key_sounds()
 
     print()
     if FAILURES:

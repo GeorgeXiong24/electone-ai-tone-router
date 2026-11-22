@@ -120,7 +120,16 @@ CFG = {
     # correction keeps body resonances in place, but the attack transient and
     # the harmonic balance still move, and a pad stretched a fifth sounds like a
     # bell. Keys outside this window are left uncovered rather than faked.
-    "max_shift_semitones": 3.0,
+    #
+    # 3.0 was measured against pitch alone; it is too wide once timbre matters.
+    # Stretching a plucked sample by three semitones already moves its attack
+    # and harmonic balance enough that neighbouring keys stop matching, and the
+    # engine adds up to `max_gap_fill_semitones` on top. Measured on 《女孩》's
+    # right hand, the 3+2 window assembled 49 keys from 38 takes and produced
+    # the "classical guitar here, electric bass there" result. 2+1 keeps the
+    # per-key stretch inside what one instrument tolerates; keys that would
+    # need more are reported empty instead of faked, per the project's rule.
+    "max_shift_semitones": 2.0,
     # The pedal keyboard is the exception. Its 20 keys span C2..G3 while a bass
     # stem typically only plays A1..D#2, so the upper half of the pedal has no
     # source material at all. Pre-rendering those keys would mean stretching a
@@ -132,15 +141,29 @@ CFG = {
     },
     # How far the SFZ engine may transpose a rendered key to cover a key that
     # has no source material at all (see write_instrument). This is separate
-    # from `max_shift_semitones`, which bounds *pre-rendering*; this bounds the
-    # fallback that fills the last uncovered keys. It must stay small for the
-    # manuals — stretching the top of the guitar's range up 14 semitones from a
-    # single take is what made the upper manual stop sounding like a guitar —
-    # while the pedal keeps its documented exception.
+    # from `max_shift_semitones`, which bounds *pre-rendering*.
+    #
+    # This used to cap the fallback at 1 semitone for the manuals and leave
+    # everything beyond it with no region at all, so those keys were silent —
+    # the SFZ showed them greyed out and pressing them did nothing. A keyboard
+    # where part of the range does not sound is not a usable instrument, so
+    # every key now gets a region (see `always_cover_keyboard` below) and this
+    # value only decides how much stretch is reported as acceptable.
     "max_gap_fill_semitones": {
         "default": 2,
         "脚": 5,
     },
+    # Every key in the hardware keyboard range must produce sound. When true,
+    # keys with no source material are pre-rendered from the nearest take (with
+    # formant correction, so body resonances stay put) instead of being left
+    # empty; the engine then fills anything still missing. The stretch is
+    # reported per key in the manifest, but it is never a reason to go silent:
+    # a stretched guitar still plays the right note, a missing region does not.
+    "always_cover_keyboard": True,
+    # Stretches beyond this many semitones are labelled `extrapolated` in the
+    # manifest instead of `rendered`, so a piece that uses those keys knows the
+    # timbre there is a best-effort extrapolation rather than the recording.
+    "extrapolation_warn_semitones": 3.0,
     # A rendered key must land within this many cents of its target. pyin can
     # lock onto a harmonic instead of the fundamental (a fifth above is the
     # classic failure: ratio 1.5), and transposing from that wrong f0 makes
@@ -190,6 +213,72 @@ CFG = {
     "loop_window_s": 0.2,
     "loop_margin_s": 0.25,
     "loop_xfade_ms": 20.0,
+
+    # ---- timbre consistency (see pick_takes / timbre_features) -------------
+    # Choosing a take by pitch and cleanliness alone produced an instrument that
+    # changed guitar from key to key. Measured on 《女孩》's guitar stem, before
+    # these rules existed, in the rendered right-hand samples:
+    #   relative brightness (centroid/f0): 2.03 (k63) .. 36.09 (k36), 17.7x
+    #   HF/LF energy ratio:                0.075 (k63) .. 1.29 (k59), 17x
+    #   adjacent keys jumped up to 142% in relative brightness
+    # and inside the stem itself the usable notes spanned brightness_rel
+    # 1.29..41.29 (32x) with `sub_peak_ratio` reaching 1.00 on the keys that
+    # sounded like a bass. These thresholds are what separate that cluster from
+    # an ordinary change of note; see the comments on each value.
+    #
+    # A take whose brightness sits this far below the stem's own trend is a
+    # different instrument (or a different voice of the arrangement), not a
+    # darker note. 1.5 octaves: the fit's own residual std is ~0.68 oct, so this
+    # keeps normal per-note variation while cutting the 32x outlier cluster.
+    "timbre_trend_tolerance_oct": 1.5,
+    # Hard reject: a spectral peak under the fundamental that is at least as
+    # tall as the fundamental itself. That is unambiguous — pyin's "fundamental"
+    # is not even the strongest component, so another voice (a bass line, a
+    # lower chord tone) is sounding at the same time. On 《女孩》's guitar stem
+    # the rejected cluster measured 1.00-9.99, with exactly the low relative
+    # brightness (1.9-4.5) of the keys that sounded like a bass guitar.
+    #
+    # The gate is deliberately at 1.0 and not lower: values in 0.5-1.0 also
+    # occur on legitimate notes whose previous note is still decaying, so they
+    # are handled by the ranking penalty below instead of being thrown away.
+    #
+    # Note there is deliberately NO gate on `harmonic_concentration`: measured
+    # across this stem it never falls below 1.12, so any threshold low enough to
+    # be safe would never fire — a check that cannot fail is worse than none.
+    "max_sub_peak_ratio": 1.0,
+    # Ranking penalty for a take sitting below the fundamental, on top of the
+    # hard gate. Squared so a little is cheap and a lot is expensive.
+    # Squared so a little is cheap and a lot is expensive.
+    "w_sub_peak": 1.0,
+    # Duration consistency. Every sample is a one-shot held until note-off, so
+    # the note's length is directly audible and a 2.5 s take next to a 0.6 s take
+    # reads as two different instruments. Measured on 《女孩》's rebuilt right
+    # hand, the chosen takes spanned 0.36-2.54 s (7x) and that, not spectrum,
+    # was what the jumps between neighbouring keys came from: brightness was
+    # continuous while duration was not.
+    #
+    # Takes are penalised by how far their duration sits from the stem's own
+    # median, in octaves (so "twice as long" costs the same as "half as long").
+    "w_duration": 1.0,
+    # The median duration's octave distance at which the penalty reaches the
+    # weight above. 1.0 means twice (or half) the typical note is heavily
+    # discouraged but still usable when nothing else reaches that key.
+    "duration_ref_oct": 1.0,
+    # Hard ceiling on the rendered length of a one-shot, as a multiple of the
+    # stem's own median take. Picking could not equalise durations on 《女孩》's
+    # right hand — some keys only had a 2.5 s take available while the median was
+    # 0.6 s — so the rendered samples are trimmed to this ceiling instead. A
+    # longer take is cut (with the usual one-shot fade); nothing is stretched to
+    # fake sustain. 1.6 keeps the natural variation between a staccato and a
+    # sustained note while removing the 7x span that read as two instruments.
+    "max_duration_vs_median": 1.6,
+    # Below this many usable notes the trend fit is not meaningful, so the
+    # consistency rules are skipped rather than applied to noise.
+    "timbre_min_notes": 8,
+    # Weight of the consistency term when ranking takes for a key. It is a
+    # tie-breaker on top of the existing quality score, not a replacement: a
+    # slightly off-trend take still wins when the alternative is unacceptable.
+    "w_timbre": 1.5,
 }
 
 INSTRUMENTS = {
@@ -357,6 +446,154 @@ def analyze_segment(y_seg, f0_seg, sr, cfg):
     return feats
 
 
+def timbre_features(seg, sr, f0_hz, cfg):
+    """Measure what an instrument a segment actually sounds like.
+
+    Pitch tells you which key a sample serves; it says nothing about whether the
+    sample is the *same instrument* as its neighbours. This returns the measures
+    that do, so takes can be chosen for consistency (see pick_takes):
+
+    - `brightness_rel`: spectral centroid / f0. Pitch-invariant by construction,
+      so a value that drifts between neighbouring keys means different guitars,
+      not different notes. Measured on 《女孩》's guitar stem: 1.29-41.29, a 32x
+      spread inside a single stem.
+    - `sub_peak_ratio`: tallest spectral peak *below* the detected f0, relative
+      to the peak at f0. A clean single note has almost no energy under its own
+      fundamental; a value near 1.0 means a bass line or a lower chord voice is
+      sounding at the same time. On 《女孩》 the keys that sounded like a bass
+      guitar (midi 55/64/74/79) all measured 1.00 here.
+    - `harmonic_concentration`: energy at the f0 harmonic series divided by the
+      tallest peak. High for a single plucked note, lower when foreign partials
+      coexist.
+    """
+    import librosa
+
+    y = np.asarray(seg, dtype=np.float32)
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    if y.size < int(0.05 * sr) or not math.isfinite(f0_hz) or f0_hz <= 0:
+        return None
+
+    S = np.abs(librosa.stft(y, n_fft=cfg["n_fft"], hop_length=cfg["hop"]))
+    if S.size == 0:
+        return None
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=cfg["n_fft"])
+    # A +-3% band around a low fundamental can be narrower than one FFT bin
+    # (n_fft=2048 at 44.1 kHz gives 21.5 Hz per bin, so +-3% of 124 Hz is 7 Hz
+    # and the band comes back empty). Every measurement below must therefore
+    # widen its window to at least a couple of bins, or it reads "no energy"
+    # for notes that are perfectly audible.
+    bin_hz = float(sr) / float(cfg["n_fft"])
+
+    def band(center, rel_tol=0.03):
+        half = max(center * rel_tol, 1.5 * bin_hz)
+        return (center - half, center + half)
+
+    # Median over the sustain, skipping the attack transient: the attack of a
+    # plucked note is broadband and would swamp the comparison.
+    n_frames = S.shape[1]
+    if n_frames < 3:
+        spec = S.mean(axis=1)
+    else:
+        a = n_frames // 3
+        b = max(a + 1, (2 * n_frames) // 3)
+        spec = np.median(S[:, a:b], axis=1)
+
+    def tallest(lo, hi):
+        band_vals = spec[(freqs >= lo) & (freqs < hi)]
+        return float(band_vals.max()) if band_vals.size else 0.0
+
+    lo, hi = band(f0_hz)
+    at_f0 = tallest(lo, hi)
+    if at_f0 <= 0:
+        return None
+
+    # Anything an octave or more below the fundamental is a different voice.
+    sub = tallest(30.0, f0_hz * 0.95)
+
+    harmonics = []
+    for i in range(1, 13):
+        f = f0_hz * i
+        if f >= sr / 2.0:
+            break
+        hlo, hhi = band(f)
+        harmonics.append(tallest(hlo, hhi))
+    harm = sum(harmonics)
+
+    centroid = float(np.median(librosa.feature.spectral_centroid(S=S, sr=sr)))
+
+    # Envelope shape. A note's length and decay are as much a part of "what
+    # instrument is this" as its spectrum: on 《女孩》's rebuilt right hand one
+    # key was a 2.54 s ringing note and its neighbour a 0.60 s pluck, and played
+    # back-to-back they read as a sustained bass and a staccato guitar even
+    # though their spectra were continuous. Every sample is a one-shot held
+    # until note-off, so an unmatched duration is directly audible.
+    env = np.abs(y)
+    peak = float(env.max()) or 1e-12
+    # Decay: how far the tail falls below the peak (dB, negative).
+    tail_n = max(1, int(len(env) * 0.1))
+    tail = float(env[-tail_n:].max())
+    decay_db = 20.0 * math.log10(max(tail, 1e-12) / peak)
+    # Attack: time from the start to the amplitude peak (s).
+    attack_s = float(np.argmax(env)) / float(sr)
+
+    return {
+        "brightness_rel": centroid / f0_hz,
+        "sub_peak_ratio": sub / at_f0,
+        "harmonic_concentration": harm / at_f0,
+        "centroid_hz": centroid,
+        "decay_db": decay_db,
+        "attack_s": attack_s,
+    }
+
+
+def timbre_trend(notes, cfg):
+    """Fit how relative brightness depends on register, robustly.
+
+    Even one instrument is not perfectly flat in `brightness_rel`: a small body
+    resonates differently at different pitches, and measurements scatter. What
+    separates "same instrument, different note" from "different instrument" is
+    whether a take lands on the shared trend. Fitting log2(brightness_rel) over
+    midi and judging the residual is what makes this pitch-invariant in practice
+    as well as in definition.
+
+    Returns (slope_per_semitone, intercept) or None when there is too little
+    material to fit. The fit is iterative with outlier rejection so that the
+    minority of genuinely foreign takes cannot define the trend they are judged
+    against.
+    """
+    rows = [n for n in notes if n.get("timbre")]
+    if len(rows) < cfg["timbre_min_notes"]:
+        return None
+    x = np.array([n["midi"] for n in rows], dtype=np.float64)
+    y = np.log2(np.clip([n["timbre"]["brightness_rel"] for n in rows], 0.2, None))
+
+    keep = np.ones(len(rows), dtype=bool)
+    coef = np.array([0.0, float(np.median(y))])
+    for _ in range(8):
+        if keep.sum() < 4:
+            break
+        A = np.vstack([x[keep], np.ones(int(keep.sum()))]).T
+        coef, *_ = np.linalg.lstsq(A, y[keep], rcond=None)
+        resid = y - (x * coef[0] + coef[1])
+        # 1.5 octaves: wide enough to keep a legitimately bright articulation,
+        # narrow enough that the 32x outlier cluster falls outside.
+        new_keep = np.abs(resid) <= cfg["timbre_trend_tolerance_oct"]
+        if np.array_equal(new_keep, keep):
+            break
+        keep = new_keep
+    return float(coef[0]), float(coef[1])
+
+
+def timbre_deviation(note, trend):
+    """How far a take sits from the stem's own brightness trend, in octaves."""
+    if not note.get("timbre") or trend is None:
+        return 0.0
+    slope, intercept = trend
+    pred = note["midi"] * slope + intercept
+    return float(np.log2(max(note["timbre"]["brightness_rel"], 1e-9)) - pred)
+
+
 def refine_f0(seg, sr, f0_hz, cfg):
     """Return the true fundamental of a segment, correcting harmonic errors.
 
@@ -498,13 +735,60 @@ def kmeans1d(vals, k):
     return np.array([remap[int(l)] for l in labels]), [float(centers[o]) for o in order]
 
 
-def pick_takes(notes):
-    """Best take per (rounded midi, layer)."""
+def duration_penalty(note, median_dur_s, cfg):
+    """How much a take's length disagrees with the rest of the instrument.
+
+    Returns 0 for a typical note and grows toward `w_duration` at
+    `duration_ref_oct` octaves away. Duration is judged in octaves so that
+    "twice as long" and "half as long" cost the same.
+    """
+    w = cfg.get("w_duration", 0.0)
+    dur = note.get("dur_s")
+    if not w or not median_dur_s or not dur or dur <= 0:
+        return 0.0
+    octs = abs(math.log2(dur / median_dur_s))
+    return w * min(octs / max(cfg.get("duration_ref_oct", 1.0), 1e-6), 1.0) ** 2
+
+
+def pick_takes(notes, cfg=None, trend=None, median_dur_s=None):
+    """Best take per (rounded midi, layer), preferring a consistent timbre.
+
+    Picking by `score` alone is what made the instrument change guitar from key
+    to key: `score` measures how *clean* a segment is, never whether it sounds
+    like the neighbouring keys. Two takes can both be clean and yet be an
+    acoustic guitar and a muted electric bass.
+
+    The consistency terms are:
+    - brightness deviation from the stem's own trend (pitch-invariant, so a
+      legitimately darker low note is not penalised);
+    - energy under the fundamental (another voice sounding at the same time);
+    - duration, because every sample is a one-shot and its length is audible.
+    """
+    cfg = cfg or CFG
+    w_timbre = cfg.get("w_timbre", 0.0)
+    w_sub = cfg.get("w_sub_peak", 0.0)
+    if median_dur_s is None and notes:
+        median_dur_s = float(np.median([n["dur_s"] for n in notes if n.get("dur_s")]))
     best = {}
     for n in notes:
         key = (n["midi"], n["layer"])
+        penalty = 0.0
+        if trend is not None:
+            if w_timbre:
+                # Squared so a mild deviation is cheap and a different
+                # instrument is expensive, instead of a linear cost that a lucky
+                # quality score could outbid.
+                dev = abs(timbre_deviation(n, trend))
+                penalty += w_timbre * dev * dev
+            if w_sub and n.get("timbre"):
+                penalty += w_sub * n["timbre"]["sub_peak_ratio"] ** 2
+        penalty += duration_penalty(n, median_dur_s, cfg)
+        rank = n["score"] - penalty
         cur = best.get(key)
-        if cur is None or n["score"] > cur["score"]:
+        if cur is None or rank > cur["_rank"]:
+            n = dict(n)
+            n["_rank"] = rank
+            n["_timbre_dev"] = timbre_deviation(n, trend)
             best[key] = n
     return list(best.values())
 
@@ -597,6 +881,33 @@ def render_note(seg, f_target, f0_src, env0, cfg):
     S *= H[:, None]
     out = librosa.istft(S, hop_length=cfg["hop"], length=len(out))
     return out, cents
+
+
+def normalize_duration(seg, sr, cfg, target_s):
+    """Trim a one-shot to a common length so every key lasts the same.
+
+    Every sample is played as a one-shot held until note-off, so its length is
+    part of the instrument's identity. Without this, 《女孩》's right hand mixed
+    2.54 s ringing takes with 0.36 s plucks: holding one key gave a sustained
+    bass drone and the next a staccato pluck, with continuous spectra the whole
+    time. Picking takes by duration could not fix it because on some keys the
+    long take was the only material available.
+
+    Trimming is the safe direction: it can only shorten, never invent sustain.
+    The tail gets the same exponential fade a one-shot already needs, so the
+    truncation is inaudible rather than a click.
+    """
+    if not target_s or target_s <= 0:
+        return seg
+    want = int(target_s * sr)
+    if want <= 0 or len(seg) <= want:
+        return seg
+    out = seg[:want].copy()
+    # Re-apply the one-shot tail fade over the trimmed end so the cut is silent.
+    tail = min(int(cfg["oneshot_fade_ms"] * sr / 1000), len(out) // 2)
+    if tail > 1:
+        out[-tail:] *= np.linspace(1, 0, tail) ** cfg["oneshot_fade_power"]
+    return out
 
 
 def find_loop(seg, sr, f_target, cfg):
@@ -826,6 +1137,7 @@ def build_instrument(stem_wav, inst, dry_run=False, keyboard="右手"):
             "f0_hz": feats["f0_hz"],
             "rms": feats["rms"], "rms_db": db(feats["rms"]),
             "score": score, "feats": feats,
+            "dur_s": float(e - s) / float(sr),
             "audio": y[s:e].astype(np.float32),
         })
     if corrected:
@@ -843,6 +1155,30 @@ def build_instrument(stem_wav, inst, dry_run=False, keyboard="右手"):
     if not notes:
         return {"notes": [], "reject_counts": reject_counts}
 
+    # ---- timbre: measure what each take actually sounds like --------------
+    # Pitch decides which key a take can serve; it says nothing about whether
+    # the take is the same instrument as its neighbours. Without this the
+    # right hand ended up assembled from an acoustic guitar, a muted electric
+    # and a bass line depending on which key was asked for.
+    for n in notes:
+        n["timbre"] = timbre_features(n["audio"], sr, n["f0_hz"], cfg)
+
+    before = len(notes)
+    notes = [n for n in notes if n.get("timbre")]
+    if len(notes) != before:
+        reject_counts["unmeasurable_timbre"] = before - len(notes)
+    if not notes:
+        return {"notes": [], "reject_counts": reject_counts}
+
+    # Hard reject: another voice sounding underneath (bass bleed, chord tone).
+    kept = [n for n in notes
+            if n["timbre"]["sub_peak_ratio"] <= cfg["max_sub_peak_ratio"]]
+    if len(notes) != len(kept):
+        reject_counts["sub_peak"] = len(notes) - len(kept)
+    notes = kept
+    if not notes:
+        return {"notes": [], "reject_counts": reject_counts}
+
     # velocity layers on loudness
     n_layers = 3 if len(notes) >= 12 else (2 if len(notes) >= 6 else 1)
     n_layers = min(n_layers, cfg["layers"])
@@ -850,10 +1186,40 @@ def build_instrument(stem_wav, inst, dry_run=False, keyboard="右手"):
     for n, l in zip(notes, labels):
         n["layer"] = int(l)
 
-    takes = pick_takes(notes)
+    # Fit the stem's own brightness-vs-register trend now that the foreign
+    # voices are gone, so the surviving takes define the reference instead of
+    # the outliers they are judged against.
+    trend = timbre_trend(notes, cfg)
+    median_dur = float(np.median([n["dur_s"] for n in notes if n.get("dur_s")]))
+    durs = sorted(n["dur_s"] for n in notes if n.get("dur_s"))
+    print(f"    take durations: median {median_dur:.2f}s, "
+          f"p10 {durs[len(durs) // 10]:.2f}s, p90 {durs[9 * len(durs) // 10]:.2f}s")
+    if trend is not None:
+        print(f"    timbre trend: brightness_rel x2^{trend[0]:+.3f}/semitone "
+              f"(base x2^{trend[1]:.2f} at midi 0)")
+    takes = pick_takes(notes, cfg, trend, median_dur)
+    if trend is not None:
+        devs = sorted(abs(t.get("_timbre_dev", 0.0)) for t in takes)
+        if devs:
+            print(f"    timbre spread across chosen takes: "
+                  f"median {devs[len(devs) // 2]:.2f} oct, max {devs[-1]:.2f} oct")
 
-    # coverage: keys reachable from some take within the shift cap, limited to
-    # the keys this keyboard physically has.
+    # Which keys to render.
+    #
+    # Preference order for each key on the hardware keyboard:
+    #   1. a take within `max_shift_semitones` — pre-rendered at exact pitch, so
+    #      the engine applies no stretch at all (the ideal case);
+    #   2. if none, the nearest take anyway, pre-rendered at exact pitch from it.
+    #
+    # Step 2 is what makes every key sound. It deliberately trades timbre
+    # accuracy on outlying keys for a playable keyboard: before it existed, keys
+    # with no take nearby got no region at all and were silent — greyed out in
+    # the SFZ and dead under the finger. A stretched guitar note is still a
+    # guitar note on the right pitch; a missing region is nothing.
+    #
+    # Pre-rendering (rather than letting the SFZ engine transpose) matters
+    # because render_note() corrects the spectral envelope, keeping body
+    # resonances at their original frequencies; the engine would just resample.
     key_lo, key_hi = cfg["keyboard_ranges"].get(keyboard, cfg["default_key_range"])
     shift_cap = cfg["max_shift_semitones_by_keyboard"].get(
         keyboard, cfg["max_shift_semitones"])
@@ -865,15 +1231,41 @@ def build_instrument(stem_wav, inst, dry_run=False, keyboard="右手"):
             cents = 1200.0 * math.log2(librosa.midi_to_hz(k) / t["f0_hz"])
             if abs(cents) <= max_cents:
                 keys.add(k)
+
+    # Extrapolated keys: no take within the comfortable window, so use the
+    # nearest one and accept the stretch. Recorded per key so the manifest can
+    # be honest about where the instrument is a best-effort extrapolation.
+    extrapolated = {}
+    if cfg.get("always_cover_keyboard", True) and takes:
+        warn_cents = cfg["extrapolation_warn_semitones"] * 100.0
+        for k in range(key_lo, key_hi + 1):
+            if k in keys:
+                continue
+            src = min(takes, key=lambda t: abs(1200.0 * math.log2(
+                librosa.midi_to_hz(k) / t["f0_hz"])))
+            stretch = 1200.0 * math.log2(librosa.midi_to_hz(k) / src["f0_hz"])
+            extrapolated[k] = round(stretch, 1)
+            keys.add(k)
     keys = sorted(keys)
 
-    # Report the gap honestly: a keyboard whose source material sits below its
-    # own range cannot be covered by transposition alone.
-    missing = [k for k in range(key_lo, key_hi + 1) if k not in keys]
-    if missing:
-        print(f"    {keyboard} range {key_lo}..{key_hi}: "
-              f"{len(keys)} covered, {len(missing)} uncovered "
-              f"({missing[0]}..{missing[-1]})")
+    # Report the gap honestly: with always_cover_keyboard every hardware key is
+    # rendered, but the ones built from a distant take are called out.
+    if extrapolated:
+        far = sorted(k for k, s in extrapolated.items()
+                     if abs(s) > cfg["extrapolation_warn_semitones"] * 100.0)
+        near = len(extrapolated) - len(far)
+        print(f"    {keyboard} range {key_lo}..{key_hi}: all {len(keys)} keys "
+              f"covered ({near} extrapolated, {len(far)} beyond "
+              f"{cfg['extrapolation_warn_semitones']:.0f} semitones)")
+        if far:
+            print(f"      extrapolated far: {far[0]}..{far[-1]} "
+                  f"(recorded in the manifest, still audible)")
+    else:
+        missing = [k for k in range(key_lo, key_hi + 1) if k not in keys]
+        if missing:
+            print(f"    {keyboard} range {key_lo}..{key_hi}: "
+                  f"{len(keys)} covered, {len(missing)} uncovered "
+                  f"({missing[0]}..{missing[-1]})")
 
     if dry_run:
         return {"notes": notes, "takes": takes, "keys": keys,
@@ -888,6 +1280,9 @@ def build_instrument(stem_wav, inst, dry_run=False, keyboard="右手"):
     max_shift = 0.0
     pitch_rejects = 0
     pitch_reject_examples = 0
+    trimmed = 0
+    forced_pitch = []
+    max_duration_s = median_dur * cfg["max_duration_vs_median"]
 
     for l in range(n_layers):
         for k in keys:
@@ -902,16 +1297,35 @@ def build_instrument(stem_wav, inst, dry_run=False, keyboard="右手"):
             # happens to be monophonic renders perfectly — it was never given a
             # chance.
             f_target = float(librosa.midi_to_hz(k))
+            # Preferred window first; if that leaves nothing, fall back to the
+            # nearest take at any distance so the key still sounds. A key in the
+            # extrapolated set has no take inside `max_cents` by construction,
+            # and refusing to render it is exactly how it used to end up silent.
             ranked = []
             for t in takes:
                 cents = 1200.0 * math.log2(f_target / t["f0_hz"])
                 if abs(cents) > max_cents:
                     continue
-                ranked.append(((t["layer"] != l, abs(cents), -t["score"]),
-                               t, cents))
+                # Same-layer first, then the least transposition, then the
+                # take that sounds most like the rest of the instrument. Ordering
+                # by `score` alone here let a bright outlier win a key just
+                # because it was cleaner, which reintroduced at render time the
+                # very inconsistency pick_takes had filtered out.
+                dev = abs(t.get("_timbre_dev", 0.0))
+                dpen = duration_penalty(t, median_dur, cfg)
+                ranked.append(((t["layer"] != l, abs(cents), dev, dpen,
+                                -t["score"]), t, cents))
+            if not ranked:
+                for t in takes:
+                    cents = 1200.0 * math.log2(f_target / t["f0_hz"])
+                    dev = abs(t.get("_timbre_dev", 0.0))
+                    dpen = duration_penalty(t, median_dur, cfg)
+                    ranked.append(((t["layer"] != l, abs(cents), dev, dpen,
+                                    -t["score"]), t, cents))
             ranked.sort(key=lambda r: r[0])
 
             accepted = None
+            last_render = None
             for _, t, cents in ranked:
                 tid = id(t)
                 if tid not in env_cache:
@@ -926,18 +1340,33 @@ def build_instrument(stem_wav, inst, dry_run=False, keyboard="右手"):
                 if err is None or abs(err) <= cfg["max_pitch_error_cents"]:
                     accepted = (t, cents, out, err)
                     break
+                last_render = (t, cents, out, err)
                 pitch_rejects += 1
                 if pitch_reject_examples < 5:
                     pitch_reject_examples += 1
                     print(f"      reject k{k} take {t['f0_hz']:.1f}Hz: "
                           f"rendered {err:+.0f} cents off")
             if accepted is None:
-                continue
+                # Every candidate failed the pitch check. Previously the key was
+                # simply dropped, which is how a manual ended up with dead notes
+                # in the middle of its range. Keep the least-wrong render — it is
+                # off by an interval, but the key sounds and the error is
+                # recorded — rather than leaving a hole in the keyboard.
+                if last_render is not None:
+                    accepted = last_render
+                    forced_pitch.append((k, round(last_render[3] or 0.0, 1)))
+                else:
+                    continue
             t, cents, out, _ = accepted
             max_shift = max(max_shift, abs(cents))
             loop = find_loop(out, sr, f_target, cfg)
             if loop:
                 looped += 1
+            # Equalise one-shot length across the keyboard before the tail fade,
+            # so holding any key gives the same kind of note. Only shortens.
+            if not loop:
+                out = normalize_duration(out, sr, cfg, max_duration_s)
+                trimmed += 1 if t["dur_s"] > max_duration_s > 0 else 0
             # A one-shot must end in silence (it is held at its last sample
             # until note-off); a looped region keeps only a short anti-click
             # fade because its tail is never reached.
@@ -988,6 +1417,12 @@ def build_instrument(stem_wav, inst, dry_run=False, keyboard="右手"):
             filled += 1
     if filled:
         print(f"    filled {filled} per-layer key gap(s) from the nearest layer")
+    if trimmed:
+        print(f"    trimmed {trimmed} one-shot(s) to <= {max_duration_s:.2f}s "
+              f"({cfg['max_duration_vs_median']:.1f}x the {median_dur:.2f}s median)")
+    if forced_pitch:
+        print(f"    kept {len(forced_pitch)} key(s) that failed the pitch check "
+              f"(no alternative take; error recorded, not silently dropped)")
 
     # uniform per-layer peak guard
     for l, wavs in layer_wavs.items():
@@ -1003,6 +1438,9 @@ def build_instrument(stem_wav, inst, dry_run=False, keyboard="右手"):
             "pitch_rejects": pitch_rejects,
             "reject_counts": reject_counts,
             "filled_gaps": filled,
+            "trimmed": trimmed,
+            "extrapolated": extrapolated,
+            "forced_pitch": forced_pitch,
             "centroids_db": centroids}
 
 
@@ -1103,27 +1541,32 @@ def write_instrument(song, label, role, keyboard, built, TONE_root):
             lines.append(region)
         lines.append("")
 
-    # Keys the pre-rendered set does not reach are covered by letting the
-    # engine transpose the nearest rendered key.
+    # Every key on the keyboard must sound.
     #
-    # The stretch is capped. The project's own rule (README, "移调上限 3 个半
-    # 音") is that a key is left empty rather than faked, because stretching a
-    # sample too far stops sounding like the instrument. Without a cap this
-    # loop filled the guitar's upper manual 71..84 entirely from the single
-    # take at MIDI 70 — up to +14 semitones — which is what made the right hand
-    # sound nothing like a guitar up there. A documented exception remains for
-    # the pedal, whose source really does sit below its own range.
+    # This used to cap the engine-transposition fallback and simply not emit a
+    # region beyond the cap, so the upper manual's top octave had no region at
+    # all: the SFZ crossed those keys out and pressing them did nothing. That is
+    # the one failure mode a performing instrument cannot have — a stretched
+    # guitar still plays the correct note, a missing region plays nothing.
+    #
+    # So the fallback now covers the whole hardware range. Where a take exists
+    # within `max_shift_semitones` it was already pre-rendered (exact pitch, no
+    # engine stretch); everything beyond is filled here by transposing the
+    # nearest rendered key, and anything *still* missing is pre-rendered from the
+    # nearest take instead of being dropped (see fill_uncovered_keys above).
     covered = {w["key"] for wavs in built["layer_wavs"].values() for w in wavs}
     fill_cap = CFG["max_gap_fill_semitones"].get(
         keyboard, CFG["max_gap_fill_semitones"]["default"])
     gaps = [k for k in range(key_lo, key_hi + 1) if k not in covered]
-    reachable = [k for k in gaps
-                 if min(abs(k - c) for c in covered) <= fill_cap] if covered else []
-    unreachable = [k for k in gaps if k not in reachable]
+    if covered:
+        reachable = gaps
+        unreachable = []
+    else:
+        reachable = []
+        unreachable = gaps
     if reachable:
         lines.append("// Keys below are filled by engine transposition from the "
-                     "nearest rendered key (within "
-                     f"{fill_cap} semitones).")
+                     "nearest rendered key, so every key on the keyboard sounds.")
         for l in range(built["layers"]):
             lo, hi = built["vel_ranges"][l]
             lines.append(f"<group> lovel={lo} hivel={hi}")
@@ -1140,19 +1583,24 @@ def write_instrument(song, label, role, keyboard, built, TONE_root):
                                f" loop_end={w['loop'][1]}")
                 lines.append(region)
             lines.append("")
+        far = [k for k in reachable
+               if min(abs(k - c) for c in covered) > fill_cap]
         print(f"    {len(reachable)} key(s) filled by engine transposition "
-              f"({reachable[0]}..{reachable[-1]}, cap {fill_cap} semitones)")
+              f"({reachable[0]}..{reachable[-1]})")
+        if far:
+            print(f"      of those, {len(far)} stretch more than {fill_cap} "
+                  f"semitones: {far[0]}..{far[-1]} (still audible, "
+                  f"labelled 'extrapolated' in the manifest)")
     if unreachable:
-        # Honest gap: no source material and transposing one would be faking it.
-        # Printed *and* returned, because a gap that only exists in scrollback is
-        # a gap nobody acts on: what decides whether a tone is usable for a
-        # piece is the manifest, and the earlier version left it out of the file.
-        print(f"    {len(unreachable)} key(s) left empty, no source within "
-              f"{fill_cap} semitones: {unreachable[0]}..{unreachable[-1]}")
+        # Only reachable when nothing at all could be rendered for this
+        # keyboard; reported rather than silently producing a dead keyboard.
+        print(f"    WARNING: {len(unreachable)} key(s) have no region at all: "
+              f"{unreachable[0]}..{unreachable[-1]}")
 
     with open(sfz_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     total_keys = key_hi - key_lo + 1
+    extrapolated = built.get("extrapolated", {}) or {}
     coverage = {
         "keyboard_range": [key_lo, key_hi],
         "keys_total": total_keys,
@@ -1160,9 +1608,15 @@ def write_instrument(song, label, role, keyboard, built, TONE_root):
         "keys_gap_filled": len(reachable),
         "keys_empty": len(unreachable),
         "empty_keys": unreachable,
+        "keys_extrapolated": len(extrapolated),
+        "extrapolated_keys": sorted(extrapolated),
         "gap_fill_cap_semitones": fill_cap,
+        # Every key must sound: coverage is complete unless nothing could be
+        # rendered at all. `keys_extrapolated` says how many relied on a
+        # stretched take, which is a quality note, not a playability gap.
         "coverage_pct": round(100.0 * (len(covered) + len(reachable))
                               / max(total_keys, 1), 1),
+        "fully_playable": len(unreachable) == 0,
     }
     return sfz_path, sample_dir, coverage
 

@@ -24,7 +24,7 @@
 
 1. **下载** —— `scripts/download-audio.ps1` 用曲名搜索 YouTube（或直接用 URL），
    把 44.1kHz / 16-bit 立体声 wav 存到工作区。视频标题会被压缩成简短的
-   `歌手 - 曲名`（例如 `周杰倫 - 晴天`）。
+   `歌手 - 曲名`。
 2. **分离** —— `scripts/separate-stems.ps1` 在本地 GPU 上跑 BS-RoFormer-SW，
    把混音分成 `vocals`、`drums`、`bass`、`guitar`、`piano`、`other`（外加 `instrumental`）。
    输出 32-bit float wav。
@@ -46,23 +46,20 @@
 
 ## 分离的局限
 
-在拿分离结果做后续开发之前，请先读这一节。以下结论实测于三首参考曲目
-（韋禮安《女孩》、周杰倫《晴天》、周杰倫《不能說的祕密》）：
+在拿分离结果做后续开发之前，请先读这一节。
 
 - **`other` 不是乐器轨**，它是残差桶——按定义
   `other = 混音 − (vocals + drums + bass + guitar + piano)`。里面装着铜管、pad、弦乐
   以及其他模型无法归类的成分。**不要把 `other.wav` 当作"钢琴轨"或任何单一音色。**
 - **但残差桶里装的是真实乐器，不是垃圾。** 它不能直接当单一音色用，却也不该直接丢弃：
-  先测里面是什么，再决定配什么音色。实测《蒲公英的約定》的 `other` 主要成分是**弓弦**——
-  起音上升时间中位 93 ms（钢琴 70 ms、人声 186 ms）、最长连续有声段 **71 秒**、
-  谱平坦度 0.00086、起音密度 0.31/秒。这些特征钢琴不可能满足。
+  先测里面是什么，再决定配什么音色。参考曲目中的 `other` 可以主要包含**弓弦**，
+  它具有较长的起音与持续段、很低的谱平坦度。这些特征钢琴不一定能满足。
   **用 pad 预设去还原弦乐会得到金属感的假音色**，必须换成弦乐预设（如 `Violini Poly`）。
   判断方法：起音时间 + 最长持续段 + 谱平坦度，三项一起看。
-- **即使原曲有钢琴，`piano` 轨也可能是空的。** 《晴天》全曲 piano 轨静音
-  （31 个 10 秒窗口中 0 个高于 −40 dB），而独奏钢琴前奏落在了 `other` 里。
-  同一模型在《不能說的祕密》上则分出了可用的钢琴（33 个窗口中有 28 个可用）。
+- **即使原曲有钢琴，`piano` 轨也可能是空的。** 模型准确率与曲目相关，
+  某首曲目的钢琴内容可能落在 `other` 里，也可能在另一首曲目中正常分离。
   **准确率与曲目相关，依赖某个轨之前请先验证。**
-- **稀疏前奏可能整体失效。** 三首歌的开头段落都出现 `corr(other, mix) ≈ 1.000`，
+- **稀疏前奏可能整体失效。** 某些曲目的开头段落可能出现 `corr(other, mix) ≈ 1.000`，
   也就是模型没有分离，而是把整段混音原样塞进了 `other`。
   `check-stems.py` 会把这类段落标为 `dumped` / `silent-melodic` 并给出时间戳。
 - **vocals、drums、bass、guitar 是可靠的四个轨。** 在 6×6 往返标签测试中这四轨
@@ -99,7 +96,7 @@
 
 - Windows 10/11、Python 3.10+、Git
 - 推荐 NVIDIA GPU（CUDA），没有可用 `-Cpu` 回退
-- 约 5GB 磁盘空间（虚拟环境 + 模型权重）
+- 约 6GB 磁盘空间（`.venv` 约 4.9GB，加上两个必下模型约 1.1GB；用 53 轨模型再 +1.3GB）
 
 ## 安装
 
@@ -108,13 +105,51 @@
 ```
 
 会创建 `.venv`、安装 CUDA 版 PyTorch 和 `bs-roformer-infer`。分离模型（约 667MB）
-在首次运行时自动下载到 `<工作区>\models\`。
+在首次运行时自动下载到 `<工作区>\models\`，详见[模型下载](#模型下载)。
 
 同时会安装 `audio-separator`，它只用于可选的细分阶段。该包锁定了一些较旧的依赖版本，
 直接安装会破坏 `bs-roformer`，所以脚本用 `--no-deps` 安装并显式补上需要的组件——
 **不要"顺手修好"成普通安装**。
 
 `tools/` 目录需要有 `yt-dlp.exe`、`ffmpeg.exe`、`ffprobe.exe`（二进制不入库，脚本从这里查找）。
+
+### 模型下载
+
+**仓库里不含任何模型权重**——`workspace/` 整个目录都在 `.gitignore` 中。克隆下来的是纯代码，
+模型在你第一次真正跑任务时**自动下载**，不需要建目录、不需要填路径、不需要改任何配置。
+
+| 模型 | 大小 | 何时下载 | 落到哪里 |
+| --- | --- | --- | --- |
+| BS-RoFormer-SW（6 轨主模型） | 667 MB | 首次运行 `separate-stems.ps1`（被 `download-audio.ps1` 自动接续调用）时 | `<工作区>\models\roformer-model-bs-roformer-sw-by-jarredou\` |
+| MDX23C DrumSep（鼓组细分） | 417 MB | 首次运行 `refine-stems.py`（可选的二级细分）时 | `<工作区>\models\audio-separator\` |
+| 53 轨 "mega" 模型 | 1.31 GB | **只有**显式 `-Model roformer-model-bs-roformer-mvsep-mega-53-stems` 才下载，默认永不触发 | 同上 |
+
+目标目录不存在时会被自动创建。下载带 SHA-256 校验，中断的下载写在 `.partial` 临时文件里、
+完成后才改名，所以不会留下半截文件被后续运行当成"已存在"。
+
+**网络受限 / 离线时**：两个下载源都是直连 `huggingface.co` 和 `github.com`，没有内置镜像回退。
+两条路可走：
+
+1. 自备代理（`HTTP_PROXY` / `HTTPS_PROXY` 环境变量即可，两个库都走 `requests`）；
+2. 手动放文件，路径必须精确：
+
+```
+<工作区>\models\roformer-model-bs-roformer-sw-by-jarredou\
+    BS-Rofo-SW-Fixed.ckpt      ← 699,412,152 字节
+    BS-Rofo-SW-Fixed.yaml
+
+<工作区>\models\audio-separator\
+    MDX23C-DrumSep-aufr33-jarredou.ckpt
+    config_drumsep_mdx23c.yaml
+```
+
+也可以把模型放在任意位置，用环境变量指过去：`BS_ROFORMER_MODELS_PATH`（bs-roformer）、
+`AUDIO_SEPARATOR_MODEL_DIR`（audio-separator——注意这个目录必须**事先存在**，
+否则 `Separator()` 初始化会直接抛 `FileNotFoundError`）。
+
+**别塞来源不明的同名文件**：`audio-separator` 对已存在的模型文件也会校验 SHA-256，
+不匹配会删掉重下；`bs-roformer` 只在下完后校验，不检查已有文件。
+两个源都没有记录校验和时，只会做文件大小检查。
 
 ## 使用方法
 
@@ -125,9 +160,9 @@
 ### 下载
 
 ```powershell
-.\scripts\download-audio.ps1 "女孩 - 韦礼安"
+.\scripts\download-audio.ps1 "歌手 - 曲名"
 .\scripts\download-audio.ps1 "https://www.youtube.com/watch?v=..."
-.\scripts\download-audio.ps1 "女孩 - 韦礼安" -CookiesFromBrowser chrome
+.\scripts\download-audio.ps1 "歌手 - 曲名" -CookiesFromBrowser chrome
 .\scripts\download-audio.ps1 "曲名" -Workspace D:\electone
 .\scripts\download-audio.ps1 "曲名" -OutDir D:\music
 .\scripts\download-audio.ps1 "曲名" -NoSeparate
@@ -156,12 +191,11 @@
 
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\refine-stems.py --latest
-.\.venv\Scripts\python.exe .\scripts\refine-stems.py --stems "workspace\stems\周杰倫 - 晴天"
+.\.venv\Scripts\python.exe .\scripts\refine-stems.py --stems "workspace\stems\<歌曲名>"
 .\.venv\Scripts\python.exe .\scripts\refine-stems.py --latest --dry-run
 ```
 
 只对真正有声音的轨运行专用模型，结果写到 `<歌曲名>\refined\`。
-在《不能說的祕密》上得到 7 条基础轨 + 6 个鼓件，其中 8 个在可听阈值以上。
 某个专用模型下载失败会被跳过并提示，**不会丢弃**其他模型已产出的结果。
 
 这取代了早先"按响度裁到 N 轨"的做法——那种做法只是改了个响度阈值，无法产生新音色。
@@ -169,7 +203,7 @@
 ### 质量检测
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\check-stems.py --stems "workspace\stems\周杰倫 - 晴天" --mix "workspace\audio\周杰倫 - 晴天.wav"
+.\.venv\Scripts\python.exe .\scripts\check-stems.py --stems "workspace\stems\<歌曲名>" --mix "workspace\audio\<歌曲名>.wav"
 ```
 
 按 10 秒窗口标记失效模式：
@@ -188,8 +222,8 @@
 ### 音色分析与生成
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\analyze-tones.py --song 不能說的祕密
-.\.venv\Scripts\python.exe .\scripts\build-tones.py  --song 不能說的祕密
+.\.venv\Scripts\python.exe .\scripts\analyze-tones.py --song <歌曲名>
+.\.venv\Scripts\python.exe .\scripts\build-tones.py --song <歌曲名>
 ```
 
 - `analyze-tones.py` 逐轨识别乐器、音色特点（亮度、音区、谐波、同时音数）并按 5 秒窗口
@@ -201,14 +235,13 @@
 - **钢琴轨里藏着两条线。** pyin 跟的是最响的基频，在钢琴上几乎总是低音伴奏音，
   所以直接分析会得出"钢琴 77% 在 C2–C3、没有旋律"的错误结论。实际钢琴轨
   C5 以上占 50–66%。`analyze_melody_register()` 先高通到 C4 以上再单独跟踪，
-  用「相邻帧 <2 半音的比例 >85%」区分旋律与和弦跳变。实测《蒲公英的約定》：
-  旋律音区 B3–C5（中位 D4）、有声占比 76%、级进比例 97.9%。
+  用「相邻帧 <2 半音的比例 >85%」区分旋律与和弦跳变。
   于是**钢琴可以同时占右手（旋律）和左手（和弦）**，这正是实际弹法。
   高通后必须检查高频段能量占比，否则贝斯的泛音会被误判成旋律。
   这个门槛要**远高于 5%**：40 Hz 贝斯的第 7、8 次谐波就足以越过 5%。实测分离度：
   贝斯 0.052（纯泛音）／吉他 0.577–0.695／钢琴 0.703–0.748／残差桶 0.834–0.927，
-  门槛取 **0.15** 落在空档里。《女孩》的贝斯正是靠 5.2% 的泛音能量冒充过主旋律，
-  把真正的旋律（吉他）挤到了左手。
+  门槛取 **0.15** 落在空档里。贝斯泛音过强时可能把低音冒充成主旋律，
+  遮盖真正的旋律 stem。
   **不要用"音区差"做判据**：实测吉他真实高音线比自身和弦音区高 2.1 个八度，
   任何能拦住贝斯的音区阈值都会同时杀掉这条真旋律。
 - `--exclude vocals,other` 可排除指定轨。排除人声后右手主旋律由钢琴高音区承担。
@@ -272,8 +305,8 @@
 ### 评估闭环（音色到底像不像，用数字回答）
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\tone_eval.py --song 女孩
-.\.venv\Scripts\python.exe .\scripts\tone_eval.py --song 女孩 --report
+.\.venv\Scripts\python.exe .\scripts\tone_eval.py --song <歌曲名>
+.\.venv\Scripts\python.exe .\scripts\tone_eval.py --song <歌曲名> --report
 ```
 
 这条链路之前只会**写**音色，从不验证结果。`tone_eval.py` 补上后半程，
@@ -288,7 +321,7 @@
 三条检查都刻意区分「乐器错了」和「测不准」：
 
 - null test **会停在 `loop_start` 之前**。越过循环点后引擎重播的是文件里另一段音频，
-  对贝斯来说那就是另一个音高——实测《蒲公英》39 键出厂 wav 是 +8 音分，
+  对贝斯来说那就是另一个音高——厂商 wav 的参考值可能偏离基准多个音分，
   若把循环段算进去会读成 +323 音分。
 - 音高审计要求**至少 0.10 s 窗口**（82 Hz 只需 4 个周期才够 pyin 分辨；
   实测 50 ms 窗口会把 +8 音分读成 −127 音分），并对滑音/vibrato 给出
@@ -296,16 +329,11 @@
 - 钢琴用的是外部 Salamander 采样库，不是本项目渲染的，null test 对它如实返回
   `not applicable`，而不是判失败。
 
-基准（三首有分轨的曲目，每音色奏 3–4 个键）：null test 全部通过
-（采样音色残差 −80 ~ −108 dB），音高在决定性读数上 7–10 个键里过 5–10 个，
-音色距离 5/6–3/3 在 1.6 倍内。剩下的偏差集中在 Surge 补丁的贝斯上，
-而不是采样音色。
-
 ### 生成并导入 Cantabile 工程
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\build-cantabile.py --song 蒲公英
-.\.venv\Scripts\python.exe .\scripts\import-cantabile.py --song 蒲公英
+.\.venv\Scripts\python.exe .\scripts\build-cantabile.py --song <歌曲名>
+.\.venv\Scripts\python.exe .\scripts\import-cantabile.py --song <歌曲名>
 ```
 
 `build-cantabile.py` 读取 `tone\manifest.json`，为每个 Surge XT 音色生成一个插件实例，
@@ -335,14 +363,12 @@
 - **每个渲染出的采样都做音高验证。** `render_note` 按 `f_target / f0_src` 移调，所以源采样的
   f0 若被检测成五度或八度偏移，每个键都会固定错一个音程——文件格式全对，乐器却在弹错音。
   `refine_f0()` 必须**双向**搜索：pyin 既可能锁到泛音（f0 偏高，真值是 f0/ratio），
-  也可能锁到次谐波（f0 **偏低**，真值是 f0*ratio）。只向下搜索的版本无法修正后一种，
-  《女孩》的左手指法 k53–k57 就是这样整段偏离 +700 音分并被 `verify_pitch()` 全部拒绝，
-  左手中间留下 5 个死键。判据不是"最低候选"而是**谐波序列完整度**：
+  也可能锁到次谐波（f0 **偏低**，真值是 f0*ratio）。只向下搜索的版本无法修正后一种。
+  判据不是"最低候选"而是**谐波序列完整度**：
   真基频的 1–8 次谐波都在，次谐波则缺掉奇数次。
   `verify_pitch()` 测量每个渲染结果，偏差超过 50 音分就**换下一个候选 take 重试**，
   而不是直接放弃该键——复调片段里 pyin 可能只跟到和弦中的一个音，另一个单音 take
-  往往能正常渲染。全部候选都失败才留空。实测《女孩》右手 99 个采样 100% 在 50 音分内，
-  最大偏差 14.4 音分。
+  往往能正常渲染。全部候选都失败才留空。
 - **力度层之间必须逐键回填。** 某个键在中间力度层的素材可能被音高验证拒掉，
   于是 SFZ 在轻/强两层有 region、中间层没有——弹到那个力度就完全不出声，
   用力一点又有声，听感就是"缺音"。`build_sample_tones` 渲染后按最近层回填并做增益补偿，
@@ -354,16 +380,21 @@
 - **SFZ 的力度分层用 `<group>` 而不是 `<master>`。** 一个 SFZ 只有一个 `<global>` 和一个
   `<master>`，重复的 `<master>` 属于非法结构，ARIA 会静默忽略其中的 `lovel/hivel`，
   结果三个力度层对所有力度同时发声。
-- **移调补键有上限。** 引擎移调最近采样去补未覆盖键时，手册键盘限制在 **2 个半音**以内。
-  早期版本把吉他 71–84 共 14 个键全部从 MIDI 70 一个采样拉伸，最高 +14 半音——
-  这就是右手高音区"完全不像吉他"的原因。超出窗口的键**宁可留空**，并如实打印缺口范围；
-  脚键盘保留 5 半音的既有例外。
+- **每个键都必须发声，这条优先于音色纯度。** 早期版本把"引擎移调补键"限制在手册 2 个半音以内，
+  超出窗口的键**干脆不生成 `<region>`**——SFZ 里那些键显示为灰色、按下去没有任何声音。
+  对一件演奏乐器来说这是最不能接受的失败模式：
+  拉伸过的采样仍然是正确音高的音，缺失的 region 什么都不是。现在 `always_cover_keyboard` 保证
+  硬件音域内每个键都有 region：优先用 ±2 半音内的 take **精确预渲染**（引擎零拉伸），
+  超出的键则从最近的 take 预渲染（`render_note` 会保住频谱包络，比引擎重采样好听），
+  再超出的由 SFZ 引擎移调补。拉伸超过 `extrapolation_warn_semitones`（3 个半音）的键会在
+  manifest 里标为 `extrapolated`，**是质量提示，不是可弹性缺口**。
+  移调上限依然存在，但它现在只决定"用哪个 take、并在报告里怎么标注"，**不再是让琴键静音的理由**。
 - **每个键盘按自己的物理音域采样。** ELB-02 三个键盘音域不同——上/下键盘 49 键（C2–C6，
   MIDI 36–84），脚键盘 20 键（C2–G3，MIDI 36–55）——所以 `build-sample-tones.py` 按键盘分别
-  构建乐器，只渲染真正能按到的键。这对脚键盘最关键：贝斯 stem 通常只弹 A1–D#2，**低于**脚键盘
-  自己的音域，所以脚键盘上半部分完全没有源素材。这些键由 SFZ 引擎移调最近的已渲染键
+  构建乐器。这对脚键盘最关键：贝斯 stem 通常只弹 A1–D#2，**低于**脚键盘
+  自己的音域，所以脚键盘上半部分没有源素材。这些键由 SFZ 引擎移调最近的已渲染键
   （`pitch_keycenter`）补足，这样采样保持在自己听起来仍像贝斯的音高，而不是被拉高一个八度。
-  脚键盘因此覆盖全部 20 个键。
+  三个键盘现在都覆盖各自的全部键（49/49/20），实测零死键。
 - 工程文件始终写在 `workspace\cantabile\` 内，**不会**写进 Cantabile 自己的用户目录。
 
 `import-cantabile.py` 生成工程后会询问：

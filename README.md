@@ -25,7 +25,7 @@ Cantabile, one timbre per keyboard (Upper / Lower / Pedal).
 
 1. **Download** — `scripts/download-audio.ps1` resolves a song name via YouTube search (or takes
    a URL directly) and saves a 44.1 kHz / 16-bit stereo wav to the workspace. The video title is
-   collapsed to a short `artist - song` name (e.g. `周杰倫 - 晴天`).
+   collapsed to a short `artist - song` name.
 2. **Separate** — `scripts/separate-stems.ps1` runs BS-RoFormer-SW locally on the GPU and splits
    the mix into `vocals`, `drums`, `bass`, `guitar`, `piano`, `other` (+ `instrumental`).
    Output is 32-bit float wav.
@@ -53,8 +53,7 @@ confused with a hung one. See [Progress reporting](#progress-reporting).
 
 ## Separation caveats
 
-Read this before building anything on top of the stems. Measured on three reference songs
-(韋禮安《女孩》, 周杰倫《晴天》, 周杰倫《不能說的祕密》):
+Read this before building anything on top of the stems.
 
 - **`other` is not an instrument.** It is the residual bucket — by definition
   `other = mix − (vocals + drums + bass + guitar + piano)`. It holds brass, pads, strings and
@@ -62,16 +61,14 @@ Read this before building anything on top of the stems. Measured on three refere
   single timbre.
 - **But the residual bucket holds real instruments, not garbage.** It cannot be used as one
   timbre, yet it should not be thrown away either: measure what is in it, then pick a matching
-  patch. On 《蒲公英的約定》 the `other` stem is dominated by **bowed strings** — median attack
-  rise 93 ms (piano 70 ms, vocals 186 ms), longest continuous run **71 s**, spectral flatness
-  0.00086, onset rate 0.31/s. A piano cannot satisfy those numbers.
+  patch. In reference measurements, the `other` stem can be dominated by **bowed strings** with
+  characteristic sustained attacks and very low spectral flatness. A piano cannot satisfy those measurements.
   **Restoring strings with a pad preset yields a metallic fake**, so use a string patch
   (`Violini Poly`). Judge with all three: attack time, longest sustained run, spectral flatness.
-- **`piano` may be empty even when the song has piano.** On 《晴天》 the piano stem was silent for
-  the whole track (0 of 31 ten-second windows above −40 dB) while a solo piano intro sat in
-  `other`. On 《不能說的祕密》 the same model produced usable piano (28 of 33 windows).
-  Accuracy is song-dependent, so check before relying on a stem.
-- **Sparse intros can fail entirely.** On all three songs the opening section showed
+- **`piano` may be empty even when the song has piano.** Model accuracy is song-dependent:
+  a stem can be silent while the piano content sits in `other`, or usable on another track.
+  Check before relying on a stem.
+- **Sparse intros can fail entirely.** Reference measurements can show
   `corr(other, mix) ≈ 1.000`, i.e. the model copied the mix into `other` instead of separating.
   `check-stems.py` reports these as `dumped` / `silent-melodic` segments with timestamps.
 - **Vocals, drums, bass and guitar are the reliable stems.** Those four routed correctly in a
@@ -112,7 +109,8 @@ process and prints:
 
 - Windows 10/11, Python 3.10+, Git
 - NVIDIA GPU recommended (CUDA); CPU fallback via `-Cpu`
-- ~5 GB free disk (venv + model weights)
+- ~6 GB free disk (`.venv` is ~4.9 GB plus ~1.1 GB for the two required models; the 53-stem
+  model adds another 1.3 GB)
 
 ## Setup
 
@@ -121,7 +119,8 @@ process and prints:
 ```
 
 Creates `.venv`, installs CUDA PyTorch and `bs-roformer-infer`. The separation model
-(~667 MB) is downloaded automatically on first run into `<workspace>\models\`.
+(~667 MB) is downloaded automatically on first run into `<workspace>\models\` — see
+[Model downloads](#model-downloads).
 
 It also installs `audio-separator`, used only for the optional refinement stage. That package
 pins some older dependencies which would break `bs-roformer`, so it is installed with
@@ -130,6 +129,48 @@ normally.
 
 `tools/` must contain `yt-dlp.exe`, `ffmpeg.exe`, `ffprobe.exe` (binaries are not committed;
 run scripts look them up there).
+
+### Model downloads
+
+**No model weights ship with the repo** — the whole `workspace/` directory is gitignored. A
+clone is pure code; weights are **downloaded automatically** the first time you actually run
+something. No directory to create, no path to configure.
+
+| Model | Size | Downloaded when | Lands in |
+| --- | --- | --- | --- |
+| BS-RoFormer-SW (6-stem main model) | 667 MB | first run of `separate-stems.ps1` (auto-chained from `download-audio.ps1`) | `<workspace>\models\roformer-model-bs-roformer-sw-by-jarredou\` |
+| MDX23C DrumSep (drum sub-stems) | 417 MB | first run of `refine-stems.py` (optional second stage) | `<workspace>\models\audio-separator\` |
+| 53-stem "mega" model | 1.31 GB | **only** with an explicit `-Model roformer-model-bs-roformer-mvsep-mega-53-stems`; never by default | same as above |
+
+Missing directories are created on demand. Downloads are SHA-256 verified, and an interrupted
+transfer is written to a `.partial` file and renamed only when complete, so a half-file is
+never mistaken for a present model.
+
+**Behind a restrictive network or offline**: both sources are direct `huggingface.co` and
+`github.com` URLs with no built-in mirror fallback. Two options:
+
+1. Use a proxy — `HTTP_PROXY` / `HTTPS_PROXY` environment variables are enough, both
+   libraries go through `requests`;
+2. Place the files by hand, exactly here:
+
+```
+<workspace>\models\roformer-model-bs-roformer-sw-by-jarredou\
+    BS-Rofo-SW-Fixed.ckpt      ← 699,412,152 bytes
+    BS-Rofo-SW-Fixed.yaml
+
+<workspace>\models\audio-separator\
+    MDX23C-DrumSep-aufr33-jarredou.ckpt
+    config_drumsep_mdx23c.yaml
+```
+
+You can also keep models anywhere and point at them by environment variable:
+`BS_ROFORMER_MODELS_PATH` (bs-roformer) and `AUDIO_SEPARATOR_MODEL_DIR` (audio-separator —
+that directory must **already exist**, otherwise `Separator()` raises `FileNotFoundError`).
+
+**Do not drop in a same-named file from an unknown source**: `audio-separator` checks the
+SHA-256 of existing model files too and re-downloads on mismatch, while `bs-roformer` verifies
+only fresh downloads and does not re-check files already on disk. When no checksum is
+recorded for an asset, only its size is checked.
 
 ## Usage
 
@@ -141,9 +182,9 @@ Download and separation run back to back.
 ### Download
 
 ```powershell
-.\scripts\download-audio.ps1 "女孩 - 韦礼安"
+.\scripts\download-audio.ps1 "artist - song"
 .\scripts\download-audio.ps1 "https://www.youtube.com/watch?v=..."
-.\scripts\download-audio.ps1 "女孩 - 韦礼安" -CookiesFromBrowser chrome
+.\scripts\download-audio.ps1 "artist - song" -CookiesFromBrowser chrome
 .\scripts\download-audio.ps1 "song" -Workspace D:\electone
 .\scripts\download-audio.ps1 "song" -OutDir D:\music
 .\scripts\download-audio.ps1 "song" -NoSeparate
@@ -172,13 +213,12 @@ Download and separation run back to back.
 
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\refine-stems.py --latest
-.\.venv\Scripts\python.exe .\scripts\refine-stems.py --stems "workspace\stems\周杰倫 - 晴天"
+.\.venv\Scripts\python.exe .\scripts\refine-stems.py --stems "workspace\stems\<song>"
 .\.venv\Scripts\python.exe .\scripts\refine-stems.py --latest --dry-run
 ```
 
 Runs specialist models on the stems that actually carry audio and writes the results to
-`<song>\refined\`. On 《不能說的祕密》 this yields 7 base stems + 6 drum pieces, of which 8 are
-above the audibility floor. A specialist that cannot be downloaded is skipped with a message;
+`<song>\refined\`. Specialists that cannot be downloaded are skipped with a message;
 it never discards stems produced by the others.
 
 Preferred over the earlier "prune to N" approach, which only renamed a loudness cutoff and could
@@ -187,7 +227,7 @@ not add timbres.
 ### Quality check
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\check-stems.py --stems "workspace\stems\周杰倫 - 晴天" --mix "workspace\audio\周杰倫 - 晴天.wav"
+.\.venv\Scripts\python.exe .\scripts\check-stems.py --stems "workspace\stems\<song>" --mix "workspace\audio\<song>.wav"
 ```
 
 Flags failure modes per 10-second window:
@@ -208,8 +248,8 @@ these numbers mean.
 ### Tone analysis & generation
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\analyze-tones.py --song 不能說的祕密
-.\.venv\Scripts\python.exe .\scripts\build-tones.py  --song 不能說的祕密
+.\.venv\Scripts\python.exe .\scripts\analyze-tones.py --song <song>
+.\.venv\Scripts\python.exe .\scripts\build-tones.py --song <song>
 ```
 
 - `analyze-tones.py` identifies each stem's instrument, timbre traits (brightness, register,
@@ -224,7 +264,6 @@ these numbers mean.
   C2–C3, no melody". In reality the piano stem has 50–66% of its energy above C5.
   `analyze_melody_register()` high-passes at C4 and tracks that band separately, using
   ">85% of frame-to-frame steps under 2 semitones" to tell a melody from chord jumps.
-  Measured on 《蒲公英的約定》: melody sits in B3–C5 (median D4), 76% voiced, 97.9% stepwise.
   So **one piano can serve both hands** — melody on the right, accompaniment on the left,
   which is how the part is actually played. After high-passing, check the high-band energy
   share (<5% means no melody), otherwise bass harmonics get mistaken for a melody.
@@ -288,8 +327,8 @@ these numbers mean.
 ### Generate & import a Cantabile song
 
 ```powershell
-.\.venv\Scripts\python.exe .\scripts\build-cantabile.py --song 蒲公英
-.\.venv\Scripts\python.exe .\scripts\import-cantabile.py --song 蒲公英
+.\.venv\Scripts\python.exe .\scripts\build-cantabile.py --song <song>
+.\.venv\Scripts\python.exe .\scripts\import-cantabile.py --song <song>
 ```
 
 `build-cantabile.py` reads `tone\manifest.json`, creates one plugin instance per Surge XT tone,
@@ -330,18 +369,26 @@ assigns MIDI channels per keyboard, and writes `workspace\cantabile\<song>.canta
   candidate that still has real spectral energy at its own fundamental, and `verify_pitch()`
   measures each rendered note and rejects it when it lands more than 50 cents off. Measured
   accuracy after both: 104 of 105 keys within 100 cents.
-- **Transposition is capped at 3 semitones.** Resampling further audibly changes the instrument —
-  the formant correction keeps body resonances in place, but the attack transient and harmonic
-  balance still move, and a pad stretched a fifth sounds like a bell. Keys outside the window stay
-  uncovered rather than faked.
+- **Every key must sound, and that outranks timbre purity.** Older versions capped the
+  engine-transposition fallback at 2 semitones for the manuals and emitted *no `<region>` at all*
+  beyond it, so those keys were greyed out in the SFZ and silent under the finger. That is the
+  one failure a
+  performing instrument cannot have — a stretched sample still plays the right note, a missing
+  region plays nothing. `always_cover_keyboard` now gives every key in the hardware range a region:
+  takes within ±2 semitones are pre-rendered at exact pitch (zero engine stretch), keys beyond that
+  are pre-rendered from the nearest take (`render_note` preserves the spectral envelope, which beats
+  the engine's plain resampling), and anything still open is filled by engine transposition. Keys
+  stretched more than `extrapolation_warn_semitones` (3 semitones) are labelled `extrapolated` in the
+  manifest — a quality note, **not** a playability gap. The stretch cap still exists, but it now
+  only decides *which take to use and how to label it*, never whether a key goes silent.
 - **Each keyboard is sampled for its own physical range.** The ELB-02 has three keyboards with
   different spans — Upper and Lower are 49 keys (C2–C6, MIDI 36–84), the Pedal is 20 keys
-  (C2–G3, MIDI 36–55) — so `build-sample-tones.py` builds one instrument per keyboard and only
-  renders keys that can actually be pressed. This matters most for the pedal: a bass stem
-  typically plays A1–D#2, which is *below* the pedal's own range, so the upper half of the pedal
-  has no source material at all. Those keys are filled by letting the SFZ engine transpose the
-  nearest rendered key (`pitch_keycenter`), which keeps the sample at a pitch where it still
-  sounds like a bass instead of stretching it an octave. The pedal therefore covers all 20 keys.
+  (C2–G3, MIDI 36–55) — so `build-sample-tones.py` builds one instrument per keyboard. This
+  matters most for the pedal: a bass stem typically plays A1–D#2, which is *below* the pedal's own
+  range, so the upper half of the pedal has no source material at all. Those keys are filled by
+  letting the SFZ engine transpose the nearest rendered key (`pitch_keycenter`), which keeps the
+  sample at a pitch where it still sounds like a bass instead of stretching it an octave. All three
+  keyboards now cover their full span (49/49/20), verified to have zero dead keys.
 - The song file always lives in `workspace\cantabile\`; nothing is written into Cantabile's own
   user folders.
 
