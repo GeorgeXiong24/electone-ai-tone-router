@@ -12,3 +12,4 @@ prompt.md
 .env.*
 !.env.example
 node_modules/
+improvements.md
