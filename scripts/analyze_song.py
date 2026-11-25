@@ -226,13 +226,19 @@ def backing_ltas(stem_feats):
 
 def build_song_profile(song, stem_dir):
     stems = {}
-    for p in sorted(glob.glob(os.path.join(stem_dir, "*.wav"))):
-        name = os.path.splitext(os.path.basename(p))[0]
-        if name in DERIVED:
-            continue
+    seen = {}
+    for ext in ("*.flac", "*.wav"):
+        for p in sorted(glob.glob(os.path.join(stem_dir, ext))):
+            name = os.path.splitext(os.path.basename(p))[0]
+            if name in DERIVED or name in seen:
+                continue
+            seen[name] = p
+    for name, p in sorted(seen.items()):
         stems[name] = analyze_stem(p)
-    vpath = os.path.join(stem_dir, "vocals.wav")
-    vp = vocal_profile(vpath) if os.path.isfile(vpath) else {}
+    vpath = next((os.path.join(stem_dir, f"vocals{ext}")
+                  for ext in (".flac", ".wav")
+                  if os.path.isfile(os.path.join(stem_dir, f"vocals{ext}"))), None)
+    vp = vocal_profile(vpath) if vpath else {}
     profile = {
         "song": song,
         "generated": datetime.datetime.now().isoformat(timespec="seconds"),

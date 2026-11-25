@@ -75,7 +75,11 @@ def harmonic_comb_mask(y, sr, f0, cents=CFG["comb_cents"],
     """
     if f0 is None or f0 <= 0:
         return y
-    n_fft = 8192
+    # Use 8192 FFT for bass (<150 Hz) where bin spacing matters, and 2048 for
+    # mid/high notes (>=150 Hz) to preserve transient & decay time resolution.
+    n_fft = 8192 if f0 < 150.0 else 2048
+    if f0 >= 150.0 and attenuate_db == CFG["comb_attenuate_db"]:
+        attenuate_db = 20.0
     S = tc.stft(y, n_fft=n_fft)
     mag, phase = np.abs(S), np.angle(S)
     freqs = np.linspace(0, sr / 2, mag.shape[0])
@@ -157,6 +161,32 @@ def _periodic_loop(body, sr, f0_target, length_s):
     return out
 
 
+def _string_damped_tail(body, sr, f0_target, length_s, damping=0.996):
+    """Extend a plucked/decaying note naturally via one-zero string damping.
+
+    Unlike static period tiling (which sounds like a buzz/organ), lowpass
+    damping seeded from the note's final period damps upper harmonics faster
+    than the fundamental, matching real plucked string physics.
+    """
+    need = int(length_s * sr)
+    n = len(body)
+    if n >= need:
+        return body[:need]
+    P = max(2, int(round(sr / max(f0_target, 20.0))))
+    if n < P + 4:
+        return np.pad(body, (0, need - n))
+    buf = body[-P:].astype(np.float64).copy()
+    out = np.empty(need, dtype=np.float64)
+    out[:n] = body
+    idx = n
+    while idx < need:
+        buf = damping * (0.25 * np.roll(buf, 1) + 0.50 * buf + 0.25 * np.roll(buf, -1))
+        take = min(P, need - idx)
+        out[idx:idx + take] = buf[:take]
+        idx += take
+    return out
+
+
 # ---------------------------------------------------------------- amplitude envelope
 
 def _amp_env(n, sr, tendency, anchor):
@@ -169,13 +199,9 @@ def _amp_env(n, sr, tendency, anchor):
     if body <= 0:
         return env
     if tendency == "percussive":
-        env[atk:] = np.exp(-np.linspace(0, 4.2, body))
+        env[atk:] = np.exp(-np.linspace(0, 4.5, body))
     elif tendency == "decaying":
-        sus = float(anchor.get("sustain_level", 0.32))
-        d = min(int(0.9 * sr), body)
-        env[atk:atk + d] = np.linspace(1.0, sus, d)
-        if atk + d < n:
-            env[atk + d:] = sus
+        env[atk:] = np.exp(-np.linspace(0, 2.8, body))
     else:  # sustained (bass)
         env[atk:] = 0.92
     return env
@@ -222,7 +248,10 @@ def resynthesize_note(anchor, target_midi, sr=tc.SR, length_s=None, **_ignored):
     f0_body = tc.estimate_f0_ac(clean, sr, fmin=25.0, fmax=1400.0) or f0_src
     ratio = f0_target / max(f0_body, 1e-3)
     body = _resample(clean, ratio)                  # clean tonal body at pitch
-    body = _periodic_loop(body, sr, f0_target, length_s)
+    if tendency == "sustained":
+        body = _periodic_loop(body, sr, f0_target, length_s)
+    else:
+        body = _string_damped_tail(body, sr, f0_target, length_s)
 
     out = body * _amp_env(len(body), sr, tendency, anchor)
     if tendency == "sustained":

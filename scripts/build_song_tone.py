@@ -292,7 +292,7 @@ def _label_for_keyboard(keyboard, info):
     voice = info.get("voice", "")
     if voice == "piano":
         return "钢琴"
-    if voice == "anchor":
+    if voice == "anchor" or str(voice).startswith("real_seed:"):
         return {"左手": "吉他", "脚": "贝斯", "右手": "主音"}.get(keyboard, INSTRUMENT_LABEL.get(keyboard, "钢琴"))
     return INSTRUMENT_LABEL.get(keyboard, "钢琴")
 
@@ -521,28 +521,101 @@ def build_keyboard_sfz(keyboard, note_fn, song_slug, *, transpose=0,
             "coherence_before": round(worst_before, 3)}
 
 
+def _ensure_song_profile(song, stem_dir):
+    """Load `song_profile.json`, running `analyze_song.py` if missing or empty."""
+    analysis_dir = os.path.join(tc.WORKSPACE, "analysis", song)
+    profile_path = os.path.join(analysis_dir, "song_profile.json")
+    prof = None
+    if os.path.isfile(profile_path):
+        try:
+            with open(profile_path, encoding="utf-8") as f:
+                prof = json.load(f)
+        except Exception:
+            prof = None
+    if prof and prof.get("stems"):
+        return prof, profile_path
+    if os.path.isdir(stem_dir):
+        import analyze_song as ans
+        prof = ans.build_song_profile(song, stem_dir)
+        os.makedirs(analysis_dir, exist_ok=True)
+        with open(profile_path, "w", encoding="utf-8") as f:
+            json.dump(prof, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(analysis_dir, "analysis.md"), "w", encoding="utf-8") as f:
+            f.write(ans.build_report(prof))
+    return prof or {}, profile_path
+
+
+def _is_dense_polyphonic(profile, stem_name):
+    """True when a stem is chordal/strummed rather than a clean monophonic line."""
+    stem = (profile.get("stems") or {}).get(stem_name) or {}
+    poly = stem.get("polyphony") or {}
+    if not poly:
+        return False
+    avg_notes = float(poly.get("avg_simultaneous_notes", 0.0) or 0.0)
+    mono_ratio = float(poly.get("monophonic_ratio", 1.0) or 0.0)
+    clean_cnt = int(poly.get("clean_mono_note_count", 0) or 0)
+    return avg_notes > 1.8 or mono_ratio < 0.35 or clean_cnt < 4
+
+
+def _build_real_seed_voice(stem_path, kind, keyboard, slug):
+    """Engine C: real recorded dry seed reshaped per-song with Match EQ."""
+    import anchor_resynth as ar
+    seeds = rs.load_seeds(kind)
+    if not seeds:
+        return None
+    y_stem, sr = tc.load_audio(stem_path, sr=SR, mono=True)
+    lo, hi = tc.render_range(keyboard)
+    kb_dir = os.path.join(tc.WORKSPACE, "tone", slug,
+                          tone_paths.ascii_keyboard(keyboard), "sfizz")
+    sample_dir = os.path.join(kb_dir, "samples", "tone")
+    os.makedirs(sample_dir, exist_ok=True)
+
+    rendered = {}
+    for key in range(lo, hi + 1):
+        y = rs.render_key(seeds, key, length_s=2.0, sr=sr, kind=kind)
+        peak = np.abs(y).max() + 1e-9
+        rendered[key] = y / peak * tc.from_db(KEY_HEADROOM_DBFS)
+
+    rendered, _worst = _coherence_pass(rendered, sr=sr)
+
+    source_ltas = np.asarray(tc.octave_band_ltas(y_stem, sr), dtype=float)
+    synth_ltas = np.mean(
+        [tc.octave_band_ltas(rendered[k], sr) for k in sorted(rendered)], axis=0)
+    src_c = source_ltas - np.median(source_ltas[1:5])
+    syn_c = synth_ltas - np.median(synth_ltas[1:5])
+    eq_oct = np.clip(src_c - syn_c, -3.5, 3.5)
+    eq = ar.fit_match_eq(src_c, syn_c, max_db=3.5)
+
+    samples = {}
+    for key in range(lo, hi + 1):
+        eqd = _apply_match_eq(rendered[key], sr, eq_oct)
+        peak = np.abs(eqd).max() + 1e-9
+        rendered[key] = eqd / peak * tc.from_db(KEY_HEADROOM_DBFS)
+        fname = f"k{key:03d}.wav"
+        tc.save_wav16(os.path.join(sample_dir, fname), rendered[key], sr)
+        samples[key] = fname
+
+    sfz_path = os.path.join(kb_dir, f"{slug}.sfz")
+    ar.build_sfz(sfz_path, {k: f"samples/tone/{v}" for k, v in samples.items()},
+                 eq=(0.0, 0.0, 0.0), keyboard=keyboard)
+    size_mb = sum(os.path.getsize(os.path.join(sample_dir, f))
+                  for f in os.listdir(sample_dir)) / (1024.0 * 1024.0)
+    return {"sfz": sfz_path, "n_keys": len(samples), "key_range": [lo, hi],
+            "voice": f"real_seed:{kind}",
+            "eq_db": [round(float(x), 2) for x in eq],
+            "samples_mb": round(size_mb, 2)}
+
+
 def build_song_instruments(song, only=""):
-    """Render the full per-key instrument set for the requested keyboards.
-
-    VOICING (this was previously wrong: all three manuals got the piano, which
-    ignores bass.flac / guitar.flac entirely):
-
-      右手 (ch1) : Piano by default (Stage-3 prior for Mandopop), or the song's
-                   own clean lead when `detect_upper_voice` finds one.
-      左手 (ch2) : the song's *guitar/accompaniment* stems, built with the
-                   Golden-Anchor engine from guitar.flac, transposed down so the
-                   hands never collide.
-      脚  (ch3) : the song's *bass* stem, built with the Golden-Anchor engine
-                   from bass.flac over C1..C4.
-    """
+    """Render the full per-key instrument set for the requested keyboards."""
     slug = tone_paths.song_slug(song)
     audit_isdir = os.path.join(tc.WORKSPACE, "stems", song)
-    decision = detect_upper_voice(
-        song, os.path.join(tc.WORKSPACE, "analysis", song, "song_profile.json"))
+    profile, profile_path = _ensure_song_profile(song, audit_isdir)
+    decision = detect_upper_voice(song, profile_path)
     report = {"song": song, "slug": slug, "upper_decision": decision,
               "keyboards": {}}
 
-    # --- per-stem Golden-Anchor instruments -------------------------------
+    # --- per-stem instruments (real_seed for strummed guitar; anchor otherwise) -
     stem_voices = {}
     for (keyboard, stem_name) in (("左手", "guitar"), ("脚", "bass")):
         src = None
@@ -556,12 +629,17 @@ def build_song_instruments(song, only=""):
                 f"{keyboard}: no {stem_name} stem, falling back to piano")
             continue
         try:
+            if stem_name == "guitar" and _is_dense_polyphonic(profile, stem_name):
+                voice = _build_real_seed_voice(src, "guitar", keyboard, slug)
+                if voice:
+                    stem_voices[keyboard] = voice
+                    continue
             voice = _build_anchor_voice(src, keyboard, slug)
             if voice:
                 stem_voices[keyboard] = voice
         except Exception as exc:      # noqa: BLE001
             report.setdefault("notes", []).append(
-                f"{keyboard}: anchor build failed ({exc}), using piano")
+                f"{keyboard}: stem build failed ({exc}), using piano")
 
     upper_fn = piano_note_fn
     upper_kind = "piano"
@@ -731,6 +809,9 @@ def _blend_anchors(anchors, target, sr=SR):
     a_lo, a_hi = anchors[lo], anchors[hi]
     span = midis[hi] - midis[lo]
     w = 0.0 if span <= 0 else (target - midis[lo]) / span
+    if a_lo.get("tendency", "decaying") != "sustained":
+        pick = a_lo if w < 0.5 else a_hi
+        return ar.resynthesize_note(pick, target, sr=sr)
     y_lo = ar.resynthesize_note(a_lo, target, sr=sr)
     if w <= 1e-3:
         return y_lo
