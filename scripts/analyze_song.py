@@ -78,6 +78,8 @@ def _envelope(y, sr, onsets):
 def _polyphony(y, sr, onsets):
     """avg_simultaneous_notes + monophonic_ratio + clean_mono_note_count/windows."""
     import librosa
+    mid = max(0, len(y) // 2 - int(30 * sr))
+    y = y[mid:mid + int(60 * sr)]
     y_h, _ = librosa.effects.hpss(y)
     chroma = librosa.feature.chroma_cqt(y=y_h, sr=sr, hop_length=tc.HOP)
     with np.errstate(invalid="ignore"):
@@ -95,7 +97,7 @@ def _polyphony(y, sr, onsets):
         if len(seg) < 4 or float(seg.mean()) > 1.3:
             continue
         s0 = i * tc.HOP; s1 = s0 + int(0.5 * sr)
-        f0 = tc.estimate_f0(y[s0:s1], sr)
+        f0 = tc.estimate_f0_ac(y[s0:s1], sr)
         if f0:
             clean.append({"t0": round(s0 / sr, 2), "dur": 0.5,
                           "f0": round(f0, 1)})
@@ -107,6 +109,8 @@ def _polyphony(y, sr, onsets):
 
 def _timbre(y, sr):
     import librosa
+    mid = max(0, len(y) // 2 - int(22.5 * sr))
+    y = y[mid:mid + int(45 * sr)]
     y_h, _ = librosa.effects.hpss(y)
     cent = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=tc.HOP)[0]
     roll = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=tc.HOP,
@@ -115,7 +119,7 @@ def _timbre(y, sr):
     e_h = float(np.sqrt((y_h ** 2).mean()))
     e_p = float(np.sqrt(((y - y_h) ** 2).mean()))
     f0, voiced, _ = librosa.pyin(y_h, fmin=55.0, fmax=1200.0, sr=sr,
-                                 frame_length=4096, hop_length=tc.HOP)
+                                 frame_length=4096, hop_length=2048)
     reg = None; rng = None
     if f0 is not None and np.any(voiced):
         vals = f0[voiced & np.isfinite(f0)]
@@ -162,15 +166,17 @@ def analyze_stem(path):
 
 
 def vocal_profile(path):
-    """Structural contour of vocals.wav ONLY (never sampled)."""
+    """Structural contour of vocals ONLY (never sampled)."""
     y, sr = tc.load_audio(path, sr=SR, mono=True)
     import librosa
-    y_h, _ = librosa.effects.hpss(y)
-    f0, voiced, _ = librosa.pyin(y_h, fmin=65.0, fmax=1100.0, sr=sr,
-                                 frame_length=4096, hop_length=tc.HOP)
     rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=tc.HOP)[0]
     active = 20 * np.log10(rms + 1e-12) > ACTIVE_DB
     active_share = float(active.mean())
+    mid = max(0, len(y) // 2 - int(22.5 * sr))
+    y_sub = y[mid:mid + int(45 * sr)]
+    y_h, _ = librosa.effects.hpss(y_sub)
+    f0, voiced, _ = librosa.pyin(y_h, fmin=65.0, fmax=1100.0, sr=sr,
+                                 frame_length=4096, hop_length=2048)
     if f0 is None or not np.any(voiced):
         return {"active_share": round(active_share, 3)}
     vals = f0[voiced & np.isfinite(f0)]
