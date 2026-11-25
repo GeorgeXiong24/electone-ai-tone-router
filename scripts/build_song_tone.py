@@ -402,7 +402,7 @@ def _coherence_pass(keys, sr=SR, stride=2, max_ratio_jump=0.25):
     # and it is transparent (a semitone), while any EQ strong enough to close a
     # 29% jump would audibly re-voice the note.
     out = dict(keys)
-    for _ in range(4):                       # a fixed point is reached quickly
+    for _ in range(len(ks)):                  # guaranteed to reach a fixed point
         ratios = [(_ratio(out[k], k), k) for k in ks]
         changed = False
         for i in range(len(ks) - 1):
