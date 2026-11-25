@@ -43,6 +43,10 @@ SURGE_VST3 = (r"C:\Program Files\Common Files\VST3\Surge Synth Team"
               r"\Surge XT.vst3\Contents\x86_64-win\Surge XT.vst3")
 SFORZANDO_VST3 = (r"C:\Program Files\Common Files\VST3\sforzando.vst3"
                   r"\Contents\x86_64-win\sforzando.vst3")
+# sfizz is the primary SFZ engine from now on: native UTF-8 paths remove the
+# sforzando/ARIA GBK mojibake constraint entirely.
+SFIZZ_VST3 = (r"C:\Program Files\Common Files\VST3\sfizz.vst3"
+              r"\Contents\x86_64-win\sfizz.vst3")
 
 # keyboard -> (MIDI channel, wiring column)
 KEYBOARD_LAYOUT = {
@@ -60,6 +64,7 @@ SKIP_INSTRUMENTS = {
 # Plugin kinds that can be imported, with the VST3 path each one needs.
 PLUGIN_VST3 = {
     "surge-xt": SURGE_VST3,
+    "sfizz": SFIZZ_VST3,
     "sforzando": SFORZANDO_VST3,
 }
 
@@ -329,6 +334,57 @@ def sforzando_plugin_object(name, plugin_data, unique_id, x, y, route_id):
     }
 
 
+def sfizz_plugin_object(name, plugin_data, unique_id, x, y, route_id):
+    """A Cantabile plugin object for sfizz (SFZ 2.0 player).
+
+    Structurally identical to the sforzando object because both are SFZ samplers
+    with one stereo output and one MIDI input; only the class id and the plugin
+    path differ, so the wiring Cantabile validates is the same.
+    """
+    guid = cf.dashed_guid(cf.SFIZZ_CLASS_ID)
+    return {
+        "kind": "Plugin",
+        "pluginPath": SFIZZ_VST3 + ">" + guid,
+        "pluginId": guid,
+        "selectedProgram": 0,
+        "autoMapAudioBusses": True,
+        "audioBusConfiguration": [
+            {"arrangement": "11", "name": "Stereo Output", "input": False,
+             "active": True},
+        ],
+        "pluginData": plugin_data,
+        "uiSettings": {
+            "guiEditorDocked": False,
+            "guiEditorPlacement": "378.4,412.8,788.8,564,False:False,1",
+            "guiEditorPlacementDetached": False,
+            "GuiEditorOpen": False, "ParameterEditorOpen": False,
+        },
+        "blobs": {},
+        "midiPassthrough": False,
+        "trackParameterChanges": False,
+        "shouldFlushTailSounds": False,
+        "runMode": "Running",
+        "midiPorts": [{
+            "IsInput": True, "midiFilter": {"items": []},
+            "pluginPortName": "MIDI In", "name": "MIDI In",
+        }],
+        "audioPorts": sforzando_audio_ports(),
+        "gain": 1, "audioBypass": False, "wetDryBalance": 1,
+        "panPosition": 0, "fadePosition": 0,
+        "pluginInputChannelCount": 0, "pluginOutputChannelCount": 2,
+        "switchPresetOnProgramChange": False,
+        "userNotes": None,
+        "stateManager": state_manager(115),
+        "solo": False, "soloControl": False,
+        "morphSets": {},
+        "wiringPositionX": x, "wiringPositionY": y,
+        "nextUniqueID": 1, "uniqueId": unique_id,
+        "routes": [audio_route(route_id, source_port="Stereo Output Out")],
+        "name": name, "sendBalance": 0, "displayExpanded": True,
+        "slotColor": "Default",
+    }
+
+
 def input_port_object(routes, unique_id, next_unique_id):
     return {
         "kind": "InputPortProvider",
@@ -398,7 +454,7 @@ def collect_tones(song_entry, song=""):
             skipped.append((rel, SKIP_INSTRUMENTS[instrument]))
             continue
         if plugin not in PLUGIN_VST3:
-            skipped.append((rel, f"{plugin} 音色不导入（只支持 Surge XT / sforzando）"))
+            skipped.append((rel, f"{plugin} 音色不导入（支持 Surge XT / sfizz / sforzando）"))
             continue
         if keyboard not in KEYBOARD_LAYOUT:
             skipped.append((rel, f"未知键盘 {keyboard}"))
@@ -417,12 +473,17 @@ def collect_tones(song_entry, song=""):
         })
 
     picked = []
+    # Any SFZ sampler outranks a synth patch: sfizz and sforzando both play real
+    # samples, which is what carries the recording's timbre. sfizz is preferred
+    # when both exist for a part (native UTF-8 paths, SFZ 2.0 complete).
+    SAMPLERS = ("sfizz", "sforzando")
     for (keyboard, instrument), cands in by_part.items():
-        sampled = [c for c in cands if c["plugin"] == "sforzando"]
+        sampled = [c for c in cands if c["plugin"] in SAMPLERS]
         if sampled:
+            sampled.sort(key=lambda c: SAMPLERS.index(c["plugin"]))
             picked.append(sampled[0])
             for c in cands:
-                if c["plugin"] != "sforzando":
+                if c is not sampled[0]:
                     skipped.append((c["rel"],
                                     f"改用采样音色（{sampled[0]['rel']}）"))
         else:
@@ -464,6 +525,16 @@ def build_song(song, tones, dry_run=False):
         if tone["plugin"] == "sforzando":
             plugin_data = cf.sforzando_plugin_data_from_sfz(tone["tone_file"])
             obj = sforzando_plugin_object(
+                name=name,
+                plugin_data=plugin_data,
+                unique_id=next_unique_id,
+                x=330 + column * 300,
+                y=140 + row * 150,
+                route_id=next_route_id,
+            )
+        elif tone["plugin"] == "sfizz":
+            plugin_data = cf.sfizz_plugin_data_from_sfz(tone["tone_file"])
+            obj = sfizz_plugin_object(
                 name=name,
                 plugin_data=plugin_data,
                 unique_id=next_unique_id,
@@ -519,8 +590,14 @@ def write_song(song_dict, song, dry_run=False):
     return path
 
 
-def verify_song(path):
-    """Re-open the written song and check every plugin blob decodes."""
+def verify_song(path, sfz_by_plugin_name=None):
+    """Re-open the written song and check every plugin blob decodes.
+
+    `sfz_by_plugin_name` maps the Cantabile plugin label back to the .sfz it was
+    built from, so a sampler's instrument file can be confirmed on disk (a
+    sfizz/sforzando state is opaque about it, or carries no path at all).
+    """
+    sfz_by_plugin_name = sfz_by_plugin_name or {}
     with open(path, encoding="utf-8") as f:
         song = json.load(f)
     problems = []
@@ -536,6 +613,16 @@ def verify_song(path):
                     cf.parse_vst3_state(state)[1])
                 if b"<patch" not in xml[:200]:
                     problems.append(f"{obj['name']}: state is not a Surge patch")
+            elif class_id in (cf.SFIZZ_CLASS_ID, cf.SFIZZ_CLASS_ID.upper()):
+                # sfizz's HOST-side state names the .sfz (measured from Cantabile's
+                # own reference song): header + uint32 length + UTF-8 path +
+                # settings tail. So the instrument file can be verified directly.
+                comp = cf.parse_vst3_state(state)[1]
+                sfz = cf.parse_sfizz_component_state(comp)
+                if not sfz:
+                    problems.append(f"{obj['name']}: sfizz state has no .sfz path")
+                elif not os.path.isfile(sfz):
+                    problems.append(f"{obj['name']}: .sfz missing: {sfz}")
             elif class_id == cf.SFORZANDO_CLASS_ID:
                 sfz, _ = cf.parse_sforzando_component_state(
                     cf.parse_vst3_state(state)[1])
@@ -641,6 +728,25 @@ def pick_song(args):
     return song, entry
 
 
+def open_in_cantabile(path):
+    """Hand the generated song to Cantabile when the app is installed."""
+    import subprocess
+    candidates = [
+        r"C:\Program Files\Cantabile\Cantabile.exe",
+        r"C:\Program Files (x86)\Cantabile\Cantabile.exe",
+    ]
+    exe = next((c for c in candidates if os.path.isfile(c)), None)
+    if not exe:
+        print("提示：未找到 Cantabile，跳过自动打开。", file=sys.stderr)
+        return False
+    try:
+        subprocess.Popen([exe, path])
+        return True
+    except Exception as exc:      # noqa: BLE001
+        print(f"提示：无法启动 Cantabile: {exc}", file=sys.stderr)
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--song", default="", help="substring of the song name")
@@ -648,6 +754,11 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--self-test", action="store_true",
                     help="round-trip a real Cantabile song file and exit")
+    ap.add_argument("--verify", action="store_true",
+                    help="emit a machine-readable verification report (used by "
+                         "the tone_export_cantabile DSH tool)")
+    ap.add_argument("--open", action="store_true",
+                    help="open the generated song in Cantabile when installed")
     args = ap.parse_args()
 
     if args.self_test:
@@ -661,28 +772,65 @@ def main():
         sys.exit(0 if all(ok for _, ok, _ in results) else 1)
 
     song, entry = pick_song(args)
-    print(f"song: {song}")
-    print(f"tone dir: {TONE_ROOT}")
+    if not args.verify:
+        print(f"song: {song}")
+        print(f"tone dir: {TONE_ROOT}")
 
     tones, skipped = collect_tones(entry, song)
-    for rel, why in skipped:
-        print(f"  skip {rel}: {why}")
+    if not args.verify:
+        for rel, why in skipped:
+            print(f"  skip {rel}: {why}")
     if not tones:
+        if args.verify:
+            print(json.dumps({"path": "", "ok": False,
+                              "error": "no tones to import"},
+                             ensure_ascii=False, indent=2))
+            sys.exit(1)
         sys.exit("no tones to import")
 
     song_dict, summary = build_song(song, tones, dry_run=args.dry_run)
     path = write_song(song_dict, song, dry_run=args.dry_run)
 
-    print()
-    for item in summary:
-        print(f"  ch{item['channel']}  {item['plugin']}")
-    print()
+    if not args.verify:
+        print()
+        for item in summary:
+            print(f"  ch{item['channel']}  {item['plugin']}")
+        print()
 
     if args.dry_run:
         print(f"[dry-run] would write {path}")
         return
 
-    plugins, problems = verify_song(path)
+    plugins, problems = verify_song(
+        path, {plugin_name_for(t): t["tone_file"] for t in tones})
+
+    # Per-song disk budget (Section 4.5): a complete run must stay under 1.2 GB.
+    budget = None
+    try:
+        import disk_budget as db
+        _ok, budget = db.check_song_budget(song)
+        if not _ok:
+            problems.append(
+                f"disk budget exceeded: {budget['total_mb']:.1f} MB > "
+                f"{budget['budget_mb']:.0f} MB")
+    except Exception as exc:      # noqa: BLE001
+        problems.append(f"disk budget check failed: {exc}")
+
+    if args.verify:
+        print(json.dumps({
+            "path": path,
+            "ok": not problems,
+            "song": song,
+            "plugins": plugins,
+            "summary": summary,
+            "skipped": [{"file": r, "why": w} for r, w in skipped],
+            "problems": problems,
+            "disk_budget": budget,
+        }, ensure_ascii=False, indent=2))
+        if args.open:
+            open_in_cantabile(path)
+        sys.exit(0 if not problems else 1)
+
     print(f"wrote {path}")
     print(f"verified {plugins} plugin(s)")
     if problems:

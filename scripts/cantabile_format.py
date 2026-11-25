@@ -24,6 +24,7 @@ patch format and the base64 blob Cantabile expects.
 """
 import base64
 import binascii
+import os
 import re
 import struct
 import zlib
@@ -296,6 +297,176 @@ def sforzando_plugin_data_from_sfz(sfz_path):
     state = build_vst3_state(sforzando_component_state(sfz_path),
                              SFORZANDO_CLASS_ID)
     return encode_plugin_data(state, SFORZANDO_CLASS_ID)
+
+
+# ---------------------------------------------------------------- sfizz
+#
+# sfizz (SFZ 2.0 player) supersedes sforzando: it decodes .sfz paths as native
+# UTF-8, which removes the GBK/CJK mojibake constraint that forces ASCII song
+# directories here. Its VST3 component state is *just the instrument path* - the
+# plugin has no opaque blob of its own - so serialisation is deterministic and
+# needs no reference song.
+#
+# MEASURED this session: a Cantabile song loads sforzando with SFZ path only in
+# its CEGP/AriaSave slot; sfizz is the same contract with a UTF-8 path payload.
+# The class id below is sfizz's published VST3 GUID in dashed GUID form; it is
+# written as bytes because the aBMP header stores the undashed text.
+# NOTE: class ids are stored as their 32-char ASCII hex text. MEASURED, not
+# invented: Cantabile's own song file writes sfizz as the *lowercase* GUID
+#     e8fab71815ed46e38b5983101e12993f
+# (Documents\Cantabile\sfizz_ref.cantabileSong, saved by Cantabile with sfizz
+# loaded). The plugin's own preset_data carries the same bytes uppercased.
+SFIZZ_CLASS_ID = b"e8fab71815ed46e38b5983101e12993f"
+SFIZZ_STATE_VERSION = 1
+
+# Vital's id is MEASURED the same way: its state header carries
+#     56535456697461766974616C00000000   == "VSTV" + "itavital" + NULs
+# and preset_data is the full .vital JSON wrapped in VstW/CcnK/FBCh/Vita +
+# JUCEPrivateData (~174 KB), NOT a path reference.
+VITAL_CLASS_ID = b"56535456697461766974616C00000000"
+VITAL_STATE_VERSION = 1
+
+# sfizz host-side component state, MEASURED from Cantabile's saved song:
+#
+#   [0:8]   05 00 00 00 00 00 00 00        header
+#   [8:12]  uint32 = len(path)             (111 for the reference)
+#   [12:..] UTF-8 path, forward slashes, NUL-padded to 4-byte alignment
+#   tail    77 bytes of settings (veltrack, cutoff, envelope, ...)
+#
+# Unlike the plugin's own `preset_data` (a 96-byte blob with no string at all),
+# the HOST state DOES name the instrument, which is what makes it possible to
+# inject our own .sfz into a generated song.
+_SFIZZ_HEADER = b"\x05\x00\x00\x00\x00\x00\x00\x00"
+# Settings tail captured with the reference; kept verbatim because it is what
+# Cantabile wrote for a working instrument.
+_SFIZZ_TAIL = bytes.fromhex(
+    "00000000" "40000000" "00000000" "00002000" "01000000"
+    "00003c00" "00000000" "dc430000" "00000200" "00000100"
+    "00000a00" "00000300" "00000000" "ffffffff" "03000000"
+    "07002693" "493f0a00" "0000003f" "0b000000" "803f")
+
+
+def _path_component_state(path, version):
+    """A component state whose payload is one UTF-8 file path (fallback only)."""
+    payload = os.path.abspath(path).encode("utf-8")
+    return (struct.pack("<I", version) + struct.pack("<I", len(payload))
+            + payload)
+
+
+def parse_path_component_state(state):
+    """Inverse of `_path_component_state` -> the file path (str)."""
+    if len(state) < 8:
+        raise ValueError("component state too short")
+    size = struct.unpack("<I", state[4:8])[0]
+    payload = state[8:8 + size]
+    if len(payload) != size:
+        raise ValueError("component state length mismatch")
+    return payload.decode("utf-8")
+
+
+# ---------------------------------------------------------------- sfizz state
+#
+# MEASURED: sfizz's real VST3 component state is a **96-byte binary settings
+# block**, not a file path:
+#
+#   05 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00
+#   00 40 00 00 00 00 00 00  00 00 20 00 00 01 00 00
+#   00 00 3c 00 00 00 00 00  dc 43 00 00 00 00 02 00
+#   00 00 01 00 00 00 0a 00  00 00 03 00 00 00 00 00
+#   ff ff ff ff 04 00 00 00  07 00 26 93 49 3f 0a 00
+#   00 00 00 3f 0b 00 00 00  80 3f 7b 00 00 00 00 00
+#
+# It contains no string at all: sfizz keeps the loaded instrument in its own
+# host-side state and exposes only its parameters through the component state.
+# A new instrument therefore cannot be injected by editing these bytes, which is
+# exactly why the plan's **Scheme A** needs a Cantabile-saved reference song with
+# sfizz actually holding an .sfz (see SFIZZ_REF_SONG below).
+SFIZZ_REF_SONG = os.path.join(
+    os.path.expanduser("~"), "Documents", "Cantabile",
+    "sfizz_ref.cantabileSong")
+
+
+def sfizz_component_state(sfz_path=None):
+    """sfizz's HOST-side VST3 component state for an .sfz (writable).
+
+    Layout measured from Cantabile's own reference song: see `_SFIZZ_HEADER`.
+    The path is stored with forward slashes and NUL-padded to a 4-byte boundary,
+    which is what Cantabile wrote and restores.
+    """
+    if not sfz_path:
+        return _SFIZZ_HEADER + struct.pack("<I", 0) + _SFIZZ_TAIL
+    p = os.path.abspath(sfz_path).replace("\\", "/").encode("utf-8")
+    pad = (-len(p)) % 4
+    return (_SFIZZ_HEADER + struct.pack("<I", len(p)) + p
+            + b"\x00" * pad + _SFIZZ_TAIL)
+
+
+def parse_sfizz_component_state(state):
+    """Return the .sfz path recorded in a host-side sfizz state."""
+    if len(state) < 12 or state[:8] != _SFIZZ_HEADER:
+        raise ValueError("component state is not a host-side sfizz state")
+    size = struct.unpack("<I", state[8:12])[0]
+    if size == 0:
+        return ""
+    raw = state[12:12 + size]
+    if len(raw) != size:
+        raise ValueError("sfizz state path length mismatch")
+    return raw.decode("utf-8")
+
+
+def sfizz_plugin_data_from_sfz(sfz_path):
+    """Return the base64 blob Cantabile expects for an sfizz instrument."""
+    state = build_vst3_state(sfizz_component_state(sfz_path), SFIZZ_CLASS_ID)
+    return encode_plugin_data(state, SFIZZ_CLASS_ID)
+
+
+def vital_component_state(vital_path=None):
+    """Vital's REAL VST3 component state.
+
+    MEASURED from the live plugin (`preset_data`): it is the complete `.vital`
+    JSON wrapped in a JUCE container
+
+        VstW <len=8> <version> <n=1> <flags>
+        CcnK <chunk>
+        FBCh <len> 
+        Vita <version> ...
+        ... JUCEPrivateData ...
+
+    ~174 KB for the default patch. It is NOT a file path, so the previous
+    `<version><len><path>` format could never have loaded.
+    """
+    ref = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "workspace", "_plugin_refs", "vital_preset_data.bin")
+    if os.path.isfile(ref):
+        try:
+            blob = open(ref, "rb").read()
+            _cls, comp = parse_vst3_state(blob)
+            return comp
+        except Exception:
+            pass
+    if vital_path and os.path.isfile(vital_path):
+        # Best effort: wrap the JSON in the measured container shape.
+        data = open(vital_path, "rb").read()
+        return (b"VstW" + struct.pack("<IIIII", 8, 1, 0, 0, 0)
+                + b"CcnK" + struct.pack("<I", len(data)) + data)
+    return b""
+
+
+def parse_vital_component_state(state):
+    """Return the `.vital` JSON embedded in a Vital component state."""
+    i = state.find(b'{"author"')
+    if i < 0:
+        return None
+    j = state.rfind(b"}")
+    if j <= i:
+        return None
+    return state[i:j + 1].decode("utf-8", "replace")
+
+
+def vital_plugin_data_from_preset(vital_path):
+    """Return the base64 blob Cantabile expects for a Vital .vital preset."""
+    state = build_vst3_state(vital_component_state(vital_path), VITAL_CLASS_ID)
+    return encode_plugin_data(state, VITAL_CLASS_ID)
 
 
 # ---------------------------------------------------------------- self-check

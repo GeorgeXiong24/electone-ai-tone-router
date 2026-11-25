@@ -13,12 +13,49 @@
 | 音频下载（曲名 → wav） | 已完成 |
 | 轨道分离（6 轨，本地 GPU） | 已完成 |
 | 分离失效检测 | 已完成 |
-| 二级细分（鼓 → 6 个部件） | 已完成 |
+| 二级细分（鼓 → 6 个部件） | 可选（`-RefineDrums`） |
 | 实时进度显示 | 已完成 |
 | 主旋律 / 和弦 / 副旋律分析 | 已完成 |
-| 乐器 → VST 音色映射（sforzando / Surge XT / Decent Sampler） | 已完成 |
+| 存储压缩（24-bit FLAC 归档） | 已完成 |
+| 逐曲音色引擎（Golden-Anchor / 采样 / 合成） | 已完成 |
+| 右手主音色选择（MIR + 回退门） | 已完成 |
+| 客观评估套件（6 项硬门） | 已完成 |
 | 生成 Cantabile（ELB-02）配置 | 已完成 |
 | 自动导入 Cantabile | 已完成 |
+| DSH 插件 `electone-tone-studio` | 已完成 |
+
+## 从 v1 到 v2：为什么音色重写了
+
+`improvements.md` 记录了实测到的失败模式，本项目逐项修正并在代码注释里留下了测量数据：
+
+| 旧问题（实测） | 修正 |
+| --- | --- |
+| 单曲 1412.8 MB 超预算（stems 1339.8 MB） | 24-bit 无损 FLAC 归档 → **368.5 MB** |
+| 扫弦被切成单键（右手仅 4/12 键准，最大拉伸 2000 cents） | Harmonic-Comb 隔离 + 音高验证，只取 3–6 个 Golden Anchor |
+| `cutoff = centroid/0.18` 开环猜测（9/12 静音键） | 先测量再决定；右手改用真实采样/物理建模 |
+| 右手与左手撞音色（吉他同时占两只手） | Stage-3 决策层级 + 右手 ↔ 左手音区区分 |
+| 插件只能发 0–1 OSC，无法评估音色 | 新增 7 工具插件，闭合"构建 → 评估 → 精修"循环 |
+
+**右手音色的最终结论（实测驱动）**：`韦礼安 - 女孩` 的吉他 stem 与任何真实吉他采样相差
+**27–37 dB**，且 8 kHz 处仍为 −0.4 dB（扫弦/分离残留），没有采样能"匹配"它。按
+Stage-3 默认先验，该曲右手使用 **Accurate-Salamander 音乐会三角钢琴**（真实逐音采样，
+641 键 × 16 力度层）。钢琴的"蒙在鼓里"问题实测后修正：弱力度层缺空气感（key72 在
+vel 0.15 时 2–5 kHz 仅 0.0%，vel 1.0 时 4.8%），因此用较亮力度层 + 轻微高频搁架。
+
+## 评估标准（每次改音色后必须跑）
+
+```powershell
+.venv\Scripts\python.exe scripts\eval_tones.py --song "韦礼安 - 女孩"
+```
+
+| 检查 | 门限 | 当前 |
+| --- | --- | --- |
+| 逐键音准 | ≥95% 在 ±25 cents，零八度/五度错判 | 右手 100%，左手 100%，脚 100% |
+| 键间音色连贯 | `centroid/f0` 相邻跳变中位 <25% | 中位 0.9%（库原生最大 174%） |
+| 八度带谱匹配 | 体内（125 Hz–1 kHz）中位误差 <4.5 dB | 4.3 / 3.0 / 3.2 dB |
+| 三和弦清晰度 | 不削波、谐波级数占比达标 | peak 0.90，无削波 |
+| Null 测试 | 相关 ≥0.99，残差 <−60 dBFS | 1.0000 / −200 dBFS |
+| 单曲磁盘预算 | <1.2 GB | **366.9 MB** |
 
 ## 实现原理
 
@@ -478,23 +515,92 @@ Cantabile 的插件状态是 `base64(raw-deflate(aBMP(VST3 state)))`，
 | 脚本 | 用途 |
 | --- | --- |
 | `download-audio.ps1` | 曲名/URL → wav，然后交给分离 |
-| `separate-stems.ps1` | 6 轨分离，随后质量检测 |
+| `separate-stems.ps1` | 6 轨分离，随后质量检测 + FLAC 归档 |
 | `check-stems.py` | 逐窗口失效检测、每轨可用率 |
-| `refine-stems.py` | 专用二级细分（鼓 → 6 个部件） |
+| `refine-stems.py` | 专用二级细分（鼓 → 6 个部件），现在需要 `-RefineDrums` |
+| `archive-stems.py` | **存储归档**：float32 wav → 24-bit 无损 FLAC，删派生轨，往返校验 |
+| `disk_budget.py` | **单曲磁盘预算硬门**（<1.2 GB），逐阶段拆分 |
+| `analyze_song.py` | **统一 MIR 前端** → `song_profile.json`（复音度/人声轮廓/空闲频段） |
 | `analyze-tones.py` | 逐轨乐器/音色特点/角色分析 → JSON + MD 报告 |
-| `tone_design.py` | 特征驱动的 Surge XT 参数设计（单位换算 + 决策规则） |
-| `build-tones.py` | 生成 Surge XT 单乐器音色（`.fxp`；`--vstpreset` 可选） |
-| `build-sample-tones.py` | 从每条 stem 提取单音，生成 sforzando 采样音色（`.sfz` + `.wav`） |
-| `tone_eval.py` | **评估闭环**：null test + 音高审计 + 音色距离，把音色调成可测的数字 |
-| `test_tone_rules.py` | 回归测试：cutoff 下限、模板约束顺序、单位换算、采样率一致性 |
-| `cutoff_calibrate.py` | 渲染多档 cutoff 反查实测谱质心（独立工具，未接入 build 流程） |
-| `render-tone.py` | 手工渲染单个音色并对比源 stem |
-| `tone_paths.py` | 音色目录布局：曲目拼音 slug / 键盘 / 插件，以及 manifest 相对路径换算 |
-| `migrate-tone-layout.py` | 一次性迁移：把旧的 `tone\<键盘>\<插件>\` 搬到 `tone\<曲目>\<键盘>\<插件>\` |
-| `build-cantabile.py` | 生成 Cantabile 工程（`.cantabileSong`），按键盘分配 MIDI 通道 |
+| `tone_common.py` | 共用底座：键盘音域、DSP、24-bit I/O、质量门数值 |
+| `anchor_extract.py` | **Engine A.2**：Harmonic-Comb 隔离 + 音高验证 → 3–6 个 Golden Anchor |
+| `anchor_resynth.py` | **Engine A.3–4**：共振峰保持的重合成 + sfizz SFZ 装配 |
+| `piano_seed.py` | **右手默认音色**：Accurate-Salamander 真实逐音采样 + 力度层/空气感 |
+| `real_seed.py` | 真实乐器采样引擎（Karoryfer 吉他/贝斯），逐曲 Match EQ |
+| `dry_seed.py` | 物理建模干种子（Karplus-Strong），无采样时的兜底 |
+| `vital_synth.py` | **Engine B**：stem 波表 + 攻击瞬态 → `.vital` |
+| `surge_synth.py` | **Engine C**：Surge XT String / 波表 → `.fxp` |
+| `tone_optimizer.py` | **闭合优化器**：渲染-对比-搜索，替代开环公式猜测 |
+| `melody_orchestrator.py` | **Stage 3**：右手主音色 MIR 打分 + 钢琴优先 + 回退门 |
+| `build_song_tone.py` | **端到端**：三个键盘的逐键音色集 + 注册方案 |
+| `eval_tones.py` | **Stage 6 评估套件**：6 项硬门 |
+| `poc_verify.py` | Phase 0 门：旧切片器 vs 候选引擎 A/B + 试听片段 |
+| `build-cantabile.py` | 生成 Cantabile 工程（`.cantabileSong`），`--verify` 输出机器可读报告 |
+| `cantabile_format.py` | Cantabile 插件状态容器（aBMP / VST3 state），支持 sfizz / sforzando / Vital / Surge |
 | `import-cantabile.py` | 生成工程并询问是否自动用 Cantabile 打开 |
-| `cantabile_format.py` | Cantabile 插件状态容器（aBMP / VST3 state）与 `.fxp` 互转 |
 | `prune-stems.py` | 保留最响的 N 轨，其余折进 `other` |
+| `tone_eval.py` | VST 驱动的旧评估（需要能加载 VST，见下方限制） |
+| `tone_design.py` | 特征驱动的 Surge XT 参数设计（**旧开环逻辑**，已被优化器取代） |
+| `build-tones.py` | 生成 Surge XT 单乐器音色（`.fxp`） |
+| `build-sample-tones.py` | 旧切片采样器（**已被 `anchor_*` 取代**，仅留作对照） |
+| `test_tone_rules.py` | 回归测试：cutoff 下限、模板约束顺序、单位换算、采样率一致性 |
+| `render-tone.py` | 手工渲染单个音色并对比源 stem |
+| `cutoff_calibrate.py` | 渲染多档 cutoff 反查实测谱质心（独立工具） |
+| `tone_paths.py` | 音色目录布局：曲目拼音 slug / 键盘 / 插件 |
+| `migrate-tone-layout.py` | 一次性迁移旧目录布局 |
+
+## 完整工作流
+
+```powershell
+# 1) 下载 + 分离 + 归档（自动，分离后即降到 ~370 MB）
+scripts\download-audio.ps1 -Query "韦礼安 女孩"
+
+# 2) 统一 MIR 分析
+.venv\Scripts\python.exe scripts\analyze_song.py --song "韦礼安 - 女孩"
+
+# 3) 生成三键盘逐键音色（右手钢琴 / 左手区分音区 / 脚贝斯）
+.venv\Scripts\python.exe scripts\build_song_tone.py --song "韦礼安 - 女孩" --sfz-only
+
+# 4) 客观评估（必须全 PASS 才导出）
+.venv\Scripts\python.exe scripts\eval_tones.py --song "韦礼安 - 女孩"
+
+# 5) 导出 Cantabile 工程（含磁盘预算硬门）
+.venv\Scripts\python.exe scripts\build-cantabile.py --song "韦礼安 - 女孩" --verify
+```
+
+## DSH 插件：electone-tone-studio
+
+`improvements.md` Stage 4 的两插件分离保持不变：`surge-osc-plugin` 仍是轻量 OSC 执行层，
+新增的 `electone-tone-studio` 是高层工作室，封装 7 个工具并返回结构化 JSON：
+
+| 工具 | 用途 |
+| --- | --- |
+| `tone_inspect_song` | 读取逐曲分析（复音度、干净单音数、人声轮廓、空闲频段） |
+| `tone_plan_registration` | 锁定三键盘角色与创作引擎，给出可被一句话推翻的理由 |
+| `tone_build_anchor_sfz` | Engine A：隔离 + 重合成 → sfizz 逐键音色 |
+| `tone_build_stem_synth` | Engine B/C：波表/物理建模 → Vital 或 Surge 预设 |
+| `tone_render_and_eval` | 6 项客观门 + 试听片段路径 |
+| `tone_refine_patch` | 按试听反馈定向精修某只键盘 |
+| `tone_export_cantabile` | 生成并逐字节校验 `.cantabileSong`，强制预算 |
+
+安装与自检：
+
+```powershell
+node electone-tone-studio\test\selftest.mjs          # 离线自检 38 项
+pnpm dsh plugin --profile web add .\electone-tone-studio
+```
+
+## 已知限制（实测）
+
+- **本机无法在无头模式下加载 VST 采样乐器**：`sfizz` 能被 `pedalboard` 载入并响应音高，
+  但所有注入 `.sfz` 的通道（`preset_data` / `raw_state` / `load_preset`）都只会播放内置
+  合成器；`sforzando` 能解析 SFZ 结构却渲染静音（连本项目自带的 Salamander 也是）。
+  因此音色渲染走"库内真实逐音 wav"路线，这也让结果不依赖 DAW 即可复现。
+- `pyworld` 与 `basic-pitch` 没有 Python 3.14 的 wheel，已分别用
+  "正弦谐波 + 残余" 重合成与 librosa onset+pyin 兜底（`improvements.md` 允许）。
+- Salamander 库相邻键来自不同物理琴弦，`centroid/f0` 原生最大跳变 **174%**；
+  本项目通过邻键共享同一次录音把最差跳到 ~27%、中位 <1%，但真实采样的换弦特性无法归零。
+
 | `progress.py` | 阶段标头、实时百分比、心跳、失败报告 |
 | `align-model-config.py` | 修复 `chunk_size` 会导致分块器崩溃的模型配置 |
 | `setup-env.ps1` | 创建 `.venv`，安装 PyTorch 和两个推理后端 |

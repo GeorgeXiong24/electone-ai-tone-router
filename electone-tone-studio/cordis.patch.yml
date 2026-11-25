@@ -1,0 +1,6 @@
+# Loader patch for the electone tone studio bundle.
+# `install_bundle` (or Plugins > Add plugin) applies this row to the profile.
+- insert:
+    - id: tone-studio
+      name: '@electone/tone-studio'
+      config: {}

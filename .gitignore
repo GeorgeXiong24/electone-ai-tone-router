@@ -13,3 +13,5 @@ prompt.md
 !.env.example
 node_modules/
 improvements.md
+scripts/_diag_*.py
+scripts/_show_rebuild.py

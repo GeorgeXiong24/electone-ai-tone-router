@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Position = 0)]
     [string]$AudioFile,
     [string]$Workspace,
@@ -6,7 +6,8 @@
     [switch]$Cpu,
     [switch]$Clean,
     [int]$Top = 0,
-    [switch]$KeepAll
+    [switch]$KeepAll,
+    [switch]$RefineDrums
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -187,4 +188,34 @@ if ($limit -gt 0 -and (Test-Path $python) -and (Test-Path $pruner)) {
     & $python $pruner --stems $outDir --top $limit
 } elseif ($limit -gt 0) {
     Write-Host "提示：未找到 prune-stems.py，保留全部 $($produced.Count) 个轨道。"
+}
+
+# --- Storage normalization (improvements.md §4.1-4.3) -----------------------
+# A 5-minute song otherwise leaves 1.3-1.4 GB of uncompressed float32 WAVs and
+# blows the 1.2 GB per-song budget. Archiving to 24-bit lossless FLAC brings a
+# typical song to ~370 MB with zero audible loss (verified by a sample-level
+# round trip before each source file is removed).
+$archiver = Join-Path $PSScriptRoot 'archive-stems.py'
+if ((Test-Path $python) -and (Test-Path $archiver)) {
+    Write-Host ''
+    Write-Host ('=' * 64)
+    Write-Host '存储归档 / 24-bit lossless FLAC archival'
+    Write-Host ('=' * 64)
+    & $python $archiver --song $name
+} else {
+    Write-Host '提示：未找到 archive-stems.py，保留原始 float32 wav。'
+}
+
+# `refine-stems.py` (6 drum sub-stems, ~618 MB) is strictly opt-in: drums are not
+# mapped to the three keyboards yet (deferred milestone, §7). Run it deliberately
+# only when the drum work starts.
+if ($RefineDrums) {
+    $refiner = Join-Path $PSScriptRoot 'refine-stems.py'
+    if ((Test-Path $python) -and (Test-Path $refiner)) {
+        Write-Host ''
+        Write-Host '鼓组细分 / refine-stems (opt-in)'
+        & $python $refiner --stems $outDir
+    }
+} else {
+    Write-Host '提示：跳过 refine-stems（鼓组细分暂不参与三键盘音色；需要时加 -RefineDrums）。'
 }

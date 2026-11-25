@@ -1,0 +1,31 @@
+{
+  "name": "@electone/tone-studio",
+  "description": "Per-song Electone tone creation: inspect, plan, build, evaluate and export",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./lib/index.js",
+    "./python-bridge": "./lib/python-bridge.js",
+    "./src/*": "./src/*",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "locale/*.json",
+    "cordis.patch.yml",
+    "tsconfig.json",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.6",
+    "typescript": "^5.6.3"
+  }
+}

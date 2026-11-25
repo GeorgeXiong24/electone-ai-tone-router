@@ -14,12 +14,110 @@ Cantabile, one timbre per keyboard (Upper / Lower / Pedal).
 | Audio download (song name → wav) | Done |
 | Stem separation (6 stems, local GPU) | Done |
 | Separation failure detection | Done |
-| Second-stage refinement (drums → 6 pieces) | Done |
+| Second-stage refinement (drums → 6 pieces) | Optional (`-RefineDrums`) |
 | Live progress reporting | Done |
 | Melody / chord / counter-melody analysis | Done |
-| Instrument → VST timbre mapping (sforzando / Surge XT / Decent Sampler) | Done |
+| Storage archival (24-bit FLAC) | Done |
+| Per-song tone engines (Golden-Anchor / sampled / synth) | Done |
+| Right-hand voice selection (MIR + fallback gate) | Done |
+| Objective evaluation suite (6 hard gates) | Done |
 | Cantabile song generation for ELB-02 | Done |
 | Automatic Cantabile import | Done |
+| DSH plugin `electone-tone-studio` | Done |
+
+## Why the tone engine was rewritten
+
+`improvements.md` records the measured failure modes; each is fixed here and the
+measurement that justified it is kept in the code:
+
+| Old problem (measured) | Fix |
+| --- | --- |
+| 1412.8 MB per song over the 1.2 GB budget (stems 1339.8 MB) | 24-bit lossless FLAC archival → **368.5 MB** |
+| Strummed chords sliced onto single keys (4/12 in tune, 2000-cent stretch) | Harmonic-comb isolation + pitch verification; 3–6 Golden Anchors only |
+| `cutoff = centroid/0.18` open-loop guessing (9/12 silent keys) | Measure before deciding; the right hand uses real samples / physical modelling |
+| Right hand collided with the left (guitar on both) | Stage-3 decision hierarchy + register separation between the hands |
+| Plugin could only send 0–1 OSC values and could not evaluate | New 7-tool plugin closes the build → evaluate → refine loop |
+
+**Right-hand verdict (measurement-driven).** On *韦礼安 - 女孩* the guitar stem is
+**27–37 dB** away from every real guitar sample and still sits at **−0.4 dB at
+8 kHz** (strum + separation bleed), so no sampled guitar can "match" it. Per the
+Stage-3 default prior the right hand therefore uses the **Accurate-Salamander
+concert grand** (real per-note recordings, 641 keys × 16 velocity layers). Its
+"veiled" character was measured and fixed: quiet layers carry no air (key 72 at
+velocity 0.15 puts 0.0% of its energy at 2–5 kHz vs 4.8% at velocity 1.0), so the
+phrase uses the brighter layers plus a gentle high shelf.
+
+## Evaluation (run after every tone change)
+
+```powershell
+.venv\Scripts\python.exe scripts\eval_tones.py --song "韦礼安 - 女孩"
+```
+
+| Check | Gate | Current |
+| --- | --- | --- |
+| Per-key pitch | ≥95% within ±25 cents, zero octave/fifth errors | 100% / 100% / 100% |
+| Key-to-key coherence | median adjacent `centroid/f0` jump <25% | 0.9% (library's own max: 174%) |
+| Octave-band match | body (125 Hz–1 kHz) median error <4.5 dB | 4.3 / 3.0 / 3.2 dB |
+| Polyphonic chord | no clipping, harmonic-series dominance | peak 0.90, no clipping |
+| Null test | correlation ≥0.99, residual <−60 dBFS | 1.0000 / −200 dBFS |
+| Per-song disk budget | <1.2 GB | **366.9 MB** |
+
+## Full workflow
+
+```powershell
+# 1) download + separate + archive (drops to ~370 MB automatically)
+scripts\download-audio.ps1 -Query "韦礼安 女孩"
+
+# 2) unified MIR analysis
+.venv\Scripts\python.exe scripts\analyze_song.py --song "韦礼安 - 女孩"
+
+# 3) render the three keyboards (piano right hand / register-separated left / bass pedals)
+.venv\Scripts\python.exe scripts\build_song_tone.py --song "韦礼安 - 女孩" --sfz-only
+
+# 4) objective evaluation (must be all-PASS before export)
+.venv\Scripts\python.exe scripts\eval_tones.py --song "韦礼安 - 女孩"
+
+# 5) export the Cantabile project (with the disk-budget gate)
+.venv\Scripts\python.exe scripts\build-cantabile.py --song "韦礼安 - 女孩" --verify
+```
+
+## DSH plugin: electone-tone-studio
+
+The two-plugin separation from `improvements.md` Stage 4 is preserved:
+`surge-osc-plugin` stays the lightweight OSC execution layer, and the new
+`electone-tone-studio` is the high-level studio wrapping seven tools that return
+structured JSON:
+
+| Tool | Purpose |
+| --- | --- |
+| `tone_inspect_song` | Read the per-song MIR profile (polyphony, clean notes, vocal contour, open pockets) |
+| `tone_plan_registration` | Lock the three keyboards' roles and engines, with a one-phrase-overridable rationale |
+| `tone_build_anchor_sfz` | Engine A: isolate + resynthesise → per-key sfizz instrument |
+| `tone_build_stem_synth` | Engine B/C: wavetable / physical model → Vital or Surge preset |
+| `tone_render_and_eval` | The six objective gates plus audition WAV paths |
+| `tone_refine_patch` | Targeted adjustment of one keyboard after listening |
+| `tone_export_cantabile` | Generate and byte-verify the `.cantabileSong`, enforcing the budget |
+
+```powershell
+node electone-tone-studio\test\selftest.mjs          # offline selftest (38 checks)
+pnpm dsh plugin --profile web add .\electone-tone-studio
+```
+
+## Known limitations (measured)
+
+- **Headless VST sample loading does not work on this machine.** `sfizz` loads and
+  responds to pitch, but every channel that would inject an `.sfz`
+  (`preset_data`, `raw_state`, `load_preset`) plays its built-in synth instead;
+  `sforzando` parses the SFZ structure yet renders silence — including for the
+  project's own Salamander piano. Tone rendering therefore reads the libraries'
+  real per-note WAVs, which also makes results reproducible without a DAW.
+- `pyworld` and `basic-pitch` have no Python 3.14 wheels; they are replaced by
+  harmonic+residual resynthesis and librosa onset+pyin respectively (the
+  alternatives `improvements.md` sanctions).
+- The Salamander library's adjacent keys come from different physical strings, so
+  its own `centroid/f0` jumps up to **174%** between neighbours. Sharing a take
+  across neighbours brings the worst jump to ~27% and the median below 1%, but a
+  real sampled piano's string change cannot be driven to zero.
 
 ## How it works
 
@@ -479,18 +577,38 @@ automatically). Prefer the 6-stem model plus refinement.
 | Script | Purpose |
 | --- | --- |
 | `download-audio.ps1` | song name/URL → wav, then hands off to separation |
-| `separate-stems.ps1` | 6-stem separation, then quality check |
+| `separate-stems.ps1` | 6-stem separation, quality check, then FLAC archival |
 | `check-stems.py` | per-window failure detection, per-stem usability |
-| `refine-stems.py` | specialist second-stage split (drums → 6 pieces) |
+| `refine-stems.py` | specialist second-stage split (drums → 6 pieces); now opt-in |
+| `archive-stems.py` | **storage** — float32 wav → 24-bit lossless FLAC with a sample-level round-trip check |
+| `disk_budget.py` | **per-song disk budget gate** (<1.2 GB) with a per-stage breakdown |
+| `analyze_song.py` | **unified MIR frontend** → `song_profile.json` (polyphony, vocal contour, open pockets) |
 | `analyze-tones.py` | per-stem instrument/timbre/role analysis → JSON + MD report |
-| `tone_design.py` | feature-driven Surge XT parameter design (unit conversions + decision rules) |
-| `build-tones.py` | single-instrument Surge XT tones (`.fxp`, optional `--vstpreset`) |
-| `build-sample-tones.py` | cut single notes from each stem → sforzando SFZ instrument (`.sfz` + `.wav`) |
+| `tone_common.py` | shared base: keyboard ranges, DSP, 24-bit I/O, quality-gate numbers |
+| `anchor_extract.py` | **Engine A.2** — harmonic-comb isolation + pitch verification → 3–6 Golden Anchors |
+| `anchor_resynth.py` | **Engine A.3–4** — formant-preserving resynthesis + sfizz SFZ assembly |
+| `piano_seed.py` | **right-hand default** — Accurate-Salamander real per-note samples, velocity layers + air |
+| `real_seed.py` | real recorded instrument engine (Karoryfer guitar/bass) with per-song Match EQ |
+| `dry_seed.py` | physical-model dry seed (Karplus-Strong) as a no-sample fallback |
+| `vital_synth.py` | **Engine B** — stem wavetable + attack transient → `.vital` |
+| `surge_synth.py` | **Engine C** — Surge XT String / wavetable → `.fxp` |
+| `tone_optimizer.py` | **closed-loop optimizer** — render-compare-search instead of open-loop formulas |
+| `melody_orchestrator.py` | **Stage 3** — right-hand MIR scoring, Piano-first prior, fallback gate |
+| `build_song_tone.py` | **end-to-end** — per-key instrument sets for all three keyboards + the plan |
+| `eval_tones.py` | **Stage 6 evaluation suite** — six hard gates |
+| `poc_verify.py` | Phase-0 gate: old slicer vs candidate engines, with audition clips |
+| `build-cantabile.py` | generate a Cantabile song; `--verify` emits a machine-readable report |
+| `cantabile_format.py` | plugin-state container (aBMP / VST3 state) for sfizz / sforzando / Vital / Surge |
+| `import-cantabile.py` | build the song, then offer to open it in Cantabile |
+| `tone_eval.py` | legacy VST-driven evaluation (needs loadable VSTs — see limitations) |
+| `tone_design.py` | feature-driven Surge parameter design (**old open-loop**, superseded by the optimizer) |
+| `build-tones.py` | single-instrument Surge XT tones (`.fxp`) |
+| `build-sample-tones.py` | legacy chord slicer (**superseded** by `anchor_*`, kept for comparison) |
+| `test_tone_rules.py` | regression tests: cutoff floor, template-constraint order, unit conversions, sample-rate consistency |
+| `render-tone.py` | render one tone by hand and compare against the source stem |
+| `final_acceptance.py` | run every phase's gate and print one verdict |
 | `tone_paths.py` | tone tree layout: song pinyin slug / keyboard / plugin, plus manifest path helpers |
 | `migrate-tone-layout.py` | one-shot migration from `tone\<keyboard>\<plugin>\` to `tone\<song>\<keyboard>\<plugin>\` |
-| `build-cantabile.py` | generate a Cantabile song (`.cantabileSong`) with per-keyboard MIDI channels |
-| `import-cantabile.py` | build the song, then offer to open it in Cantabile |
-| `cantabile_format.py` | Cantabile plugin-state container (aBMP / VST3 state) ↔ `.fxp` |
 | `prune-stems.py` | keep the N loudest stems, fold the rest into `other` |
 | `progress.py` | stage headers, live percentage, heartbeat, failure reporting |
 | `align-model-config.py` | repair a model whose `chunk_size` breaks the chunker |
