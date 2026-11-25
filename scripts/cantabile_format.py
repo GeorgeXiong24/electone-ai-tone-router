@@ -337,13 +337,14 @@ VITAL_STATE_VERSION = 1
 # the HOST state DOES name the instrument, which is what makes it possible to
 # inject our own .sfz into a generated song.
 _SFIZZ_HEADER = b"\x05\x00\x00\x00\x00\x00\x00\x00"
-# Settings tail captured with the reference; kept verbatim because it is what
-# Cantabile wrote for a working instrument.
+# Settings tail captured with the reference (77 bytes); kept verbatim because
+# it is what Cantabile wrote for a working instrument.
 _SFIZZ_TAIL = bytes.fromhex(
-    "00000000" "40000000" "00000000" "00002000" "01000000"
-    "00003c00" "00000000" "dc430000" "00000200" "00000100"
-    "00000a00" "00000300" "00000000" "ffffffff" "03000000"
-    "07002693" "493f0a00" "0000003f" "0b000000" "803f")
+    "0000000040000000000000000020000001000000"
+    "003c0000000000dc430000000002000000010000"
+    "000a000000030000000000ffffffff0300000007"
+    "002693493f0a000000003f0b000000803f"
+)
 
 
 def _path_component_state(path, version):
@@ -390,15 +391,13 @@ def sfizz_component_state(sfz_path=None):
     """sfizz's HOST-side VST3 component state for an .sfz (writable).
 
     Layout measured from Cantabile's own reference song: see `_SFIZZ_HEADER`.
-    The path is stored with forward slashes and NUL-padded to a 4-byte boundary,
-    which is what Cantabile wrote and restores.
+    The path is stored with forward slashes and NUL-terminated (length includes
+    the NUL byte), which is what Cantabile wrote and restores.
     """
     if not sfz_path:
         return _SFIZZ_HEADER + struct.pack("<I", 0) + _SFIZZ_TAIL
-    p = os.path.abspath(sfz_path).replace("\\", "/").encode("utf-8")
-    pad = (-len(p)) % 4
-    return (_SFIZZ_HEADER + struct.pack("<I", len(p)) + p
-            + b"\x00" * pad + _SFIZZ_TAIL)
+    p = os.path.abspath(sfz_path).replace("\\", "/").encode("utf-8") + b"\x00"
+    return _SFIZZ_HEADER + struct.pack("<I", len(p)) + p + _SFIZZ_TAIL
 
 
 def parse_sfizz_component_state(state):
@@ -411,7 +410,7 @@ def parse_sfizz_component_state(state):
     raw = state[12:12 + size]
     if len(raw) != size:
         raise ValueError("sfizz state path length mismatch")
-    return raw.decode("utf-8")
+    return raw.rstrip(b"\x00").decode("utf-8")
 
 
 def sfizz_plugin_data_from_sfz(sfz_path):
