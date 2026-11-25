@@ -38,7 +38,7 @@ CFG = {
     "min_snr_db": 6.0,
     "min_body_rms_db": -52.0,
     "max_sub_peak_ratio": 0.35,
-    "max_timbre_residual": 0.28,
+    "max_timbre_residual": 0.22,
     "max_attack_diff_ms": 40.0,
     "n_anchors_min": 3,
     "n_anchors_max": 6,
@@ -112,14 +112,14 @@ def _segments(y, sr):
         t = a
         while t + 0.12 < b:
             t2 = min(t + 0.6, b)
-            f0 = tc.estimate_f0_ac(y[int(t * sr):int(t2 * sr)], sr)
+            f0 = tc.estimate_f0_ac(y[int(t * sr):int(t2 * sr)], sr, fmin=28.0)
             if f0:
                 segs.append((float(t), float(t2), float(f0)))
             t = t2
     if len(segs) < 3:
         t = 0.0
         while t + 0.5 <= dur:
-            f0 = tc.estimate_f0_ac(y[int(t * sr):int((t + 0.5) * sr)], sr)
+            f0 = tc.estimate_f0_ac(y[int(t * sr):int((t + 0.5) * sr)], sr, fmin=28.0)
             if f0:
                 segs.append((float(t), float(t + 0.5), float(f0)))
             t += 0.375
@@ -185,13 +185,15 @@ def _measure_note(y, sr, t0, t1, f0):
     snr_db = float(tc.db(body_rms) - tc.db(noise_floor))
 
     # Spectral measurements: timbre, sub-harmonic bleed.
-    S = np.abs(tc.stft(seg))
+    n_fft = 8192 if f0 < 150.0 else 4096
+    S = np.abs(tc.stft(seg, n_fft=n_fft))
     freqs = np.linspace(0, sr / 2, S.shape[0])
     power = (S ** 2).mean(axis=1)
     centroid = float((freqs * power).sum() / (power.sum() + 1e-12))
+    bin_hz = sr / float(n_fft)
 
     def band_power(fc):
-        sel = np.abs(freqs - fc) < max(20.0, 0.04 * fc)
+        sel = np.abs(freqs - fc) <= max(20.0, 0.04 * fc, 1.5 * bin_hz)
         return float(power[sel].sum()) if sel.any() else 0.0
     p_f0 = band_power(f0)
     p_sub = max(band_power(f0 / 2.0), band_power(f0 / 3.0), band_power(f0 / 1.5))
@@ -242,16 +244,18 @@ def _verify_pitch(seg, sr, f0, loose=False):
     """
     if f0 is None or f0 <= 0 or len(seg) < 512:
         return False, f0
-    S = np.abs(tc.stft(seg))
+    n_fft = 8192 if f0 < 150.0 else 4096
+    S = np.abs(tc.stft(seg, n_fft=n_fft))
     freqs = np.linspace(0, sr / 2, S.shape[0])
     power = (S ** 2).mean(axis=1)
     total = float(power.sum()) + 1e-12
+    bin_hz = sr / float(n_fft)
     comb = 0.0
     for k in range(1, 17):
         fk = f0 * k
         if fk > sr / 2:
             break
-        tol = fk * (2 ** (CFG["harm_comb_cents"] / 1200.0) - 1.0)
+        tol = max(fk * (2.0 ** (CFG["harm_comb_cents"] / 1200.0) - 1.0), 1.5 * bin_hz)
         sel = np.abs(freqs - fk) <= tol
         comb += float(power[sel].sum()) if sel.any() else 0.0
     comb_ratio = comb / total
@@ -328,6 +332,9 @@ def _timbre_cluster(cands):
     # spread over the register so resynthesis never has to stretch far.
     timbres = np.array([c["timbre"] for c in uniq])
     centre = float(np.median(timbres))
+    coherent = [c for c in uniq if abs(c["timbre"] - centre) <= CFG["max_timbre_residual"]]
+    if len(coherent) >= CFG["n_anchors_min"]:
+        uniq = coherent
     order = sorted(uniq, key=lambda c: abs(c["timbre"] - centre))
     keep = order[:CFG["n_anchors_max"]]
     return sorted(keep, key=lambda c: c["midi"])
@@ -446,6 +453,24 @@ def extract_anchors(y, sr=tc.SR, n_anchors=4):
             c = pool[int(round(i))]
             if c not in chosen:
                 chosen.append(c)
+
+    # Prune outlier anchors across wide gaps (>= 4 semitones) if brightness
+    # ratio differs by > 0.35, so we never bridge mismatched articulations.
+    while len(chosen) > CFG["n_anchors_min"]:
+        centre = float(np.median([c["timbre"] for c in chosen]))
+        dropped = False
+        for i in range(len(chosen) - 1):
+            a_lo, a_hi = chosen[i], chosen[i + 1]
+            if a_hi["midi"] - a_lo["midi"] >= 4.0:
+                r_lo, r_hi = 2.0 ** a_lo["timbre"], 2.0 ** a_hi["timbre"]
+                if abs(r_hi - r_lo) / max(r_lo, 1e-9) > 0.35:
+                    drop_idx = (i if abs(a_lo["timbre"] - centre) > abs(a_hi["timbre"] - centre)
+                                else i + 1)
+                    chosen.pop(drop_idx)
+                    dropped = True
+                    break
+        if not dropped:
+            break
 
     for c in chosen:
         c.setdefault("source", "onset_pyin")

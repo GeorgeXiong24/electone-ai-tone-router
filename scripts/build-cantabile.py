@@ -463,7 +463,7 @@ def collect_tones(song_entry, song=""):
         if not os.path.isfile(tone_file):
             skipped.append((rel, "音色文件不存在"))
             continue
-        by_part.setdefault((keyboard, instrument), []).append({
+        by_part.setdefault(keyboard, []).append({
             "keyboard": keyboard,
             "instrument": instrument,
             "role": entry.get("role", ""),
@@ -473,21 +473,15 @@ def collect_tones(song_entry, song=""):
         })
 
     picked = []
-    # Any SFZ sampler outranks a synth patch: sfizz and sforzando both play real
-    # samples, which is what carries the recording's timbre. sfizz is preferred
-    # when both exist for a part (native UTF-8 paths, SFZ 2.0 complete).
-    SAMPLERS = ("sfizz", "sforzando")
-    for (keyboard, instrument), cands in by_part.items():
-        sampled = [c for c in cands if c["plugin"] in SAMPLERS]
-        if sampled:
-            sampled.sort(key=lambda c: SAMPLERS.index(c["plugin"]))
-            picked.append(sampled[0])
-            for c in cands:
-                if c is not sampled[0]:
-                    skipped.append((c["rel"],
-                                    f"改用采样音色（{sampled[0]['rel']}）"))
-        else:
-            picked.append(cands[0])
+    # Strictly one plugin instance per keyboard; priority: sfizz > vital > sforzando > surge-xt.
+    PRIORITY = ("sfizz", "vital", "sforzando", "surge-xt")
+    for keyboard, cands in by_part.items():
+        cands.sort(key=lambda c: PRIORITY.index(c["plugin"])
+                   if c["plugin"] in PRIORITY else 99)
+        picked.append(cands[0])
+        for c in cands[1:]:
+            skipped.append((c["rel"],
+                            f"同键盘已有更高优先级音色（{cands[0]['rel']}）"))
     return picked, skipped
 
 
@@ -658,8 +652,9 @@ def load_song_entry(song):
     entry = copy.deepcopy(manifest[song])
     entry.setdefault("files", [])
 
+    has_sfizz = any(e.get("plugin") == "sfizz" for e in entry["files"])
     sample_path = os.path.join(TONE_ROOT, "sample-instruments.json")
-    if os.path.isfile(sample_path):
+    if not has_sfizz and os.path.isfile(sample_path):
         with open(sample_path, encoding="utf-8") as f:
             samples = json.load(f)
         for s in samples.get(song, {}).get("files", []):
@@ -817,6 +812,13 @@ def main():
         problems.append(f"disk budget check failed: {exc}")
 
     if args.verify:
+        if plugins != 3:
+            problems.append(f"expected exactly 3 plugins, got {plugins}")
+        channels = [item["channel"] for item in summary]
+        if len(channels) != len(set(channels)) or set(channels) != {1, 2, 3}:
+            problems.append(f"expected unique channels {{1, 2, 3}}, got {channels}")
+        if any(item["host"] == "sforzando" for item in summary):
+            problems.append("legacy sforzando plugin present")
         print(json.dumps({
             "path": path,
             "ok": not problems,

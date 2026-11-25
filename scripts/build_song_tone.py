@@ -172,6 +172,11 @@ def detect_upper_voice(song, analysis_path=None):
     if not prof:
         return {"voice": "piano", "why": "无逐曲分析档案，按默认先验用钢琴"}
 
+    vocal_share = float((prof.get("vocal_melody_profile") or {}).get("active_share", 1.0) or 0.0)
+    if vocal_share >= 0.15:
+        return {"voice": "piano",
+                "why": f"人声活跃（active_share={vocal_share:.2f}），按 Stage 3 默认先验右手用钢琴"}
+
     best = None
     for name, s in (prof.get("stems") or {}).items():
         if name in ("vocals", "drums") or s.get("unusable"):
@@ -279,23 +284,25 @@ def _pitch_err(y):
 # Labels the manifest/Cantabile use for a keyboard's instrument. The tone tree
 # stores one instrument per keyboard under `tone/<slug>/<ascii-keyboard>/sfizz/`,
 # so the manifest needs the readable part name for the plugin label.
-INSTRUMENT_LABEL = {"右手": "钢琴", "左手": "钢琴", "脚": "贝斯"}
+INSTRUMENT_LABEL = {"右手": "钢琴", "左手": "吉他", "脚": "贝斯"}
 INSTRUMENT_ROLE = {"右手": "主旋律", "左手": "伴奏", "脚": "低音线条"}
+
+
+def _label_for_keyboard(keyboard, info):
+    voice = info.get("voice", "")
+    if voice == "piano":
+        return "钢琴"
+    if voice == "anchor":
+        return {"左手": "吉他", "脚": "贝斯", "右手": "主音"}.get(keyboard, INSTRUMENT_LABEL.get(keyboard, "钢琴"))
+    return INSTRUMENT_LABEL.get(keyboard, "钢琴")
 
 
 def write_manifests(song, instruments):
     """Register the freshly built instruments in the tone manifests.
 
-    THIS WAS THE ROOT CAUSE of "Cantabile plays the old broken guitar": the
-    builder wrote `tone/<slug>/<kb>/sfizz/*.sfz` but never told the manifests, and
-    `build-cantabile.py` reads only `manifest.json` / `sample-instruments.json`.
-    So the exported song kept referencing the stale 22-Nov sforzando slices while
-    the new instruments sat unused on disk.
-
-    Both manifests are updated:
-      * `manifest.json`            - the per-song tone list Cantabile consumes
-      * `sample-instruments.json`  - the sampled-instrument list
-    Entries for the same (keyboard, instrument) are replaced, never duplicated.
+    Overwrites the song's `files` list in `manifest.json` cleanly with the
+    newly generated instruments and prunes stale `sample-instruments.json`
+    entries for that song so Cantabile never stacks legacy sforzando plugins.
     """
     slug = tone_paths.song_slug(song)
     root = os.path.join(tc.WORKSPACE, "tone")
@@ -310,7 +317,7 @@ def write_manifests(song, instruments):
             "file": tone_paths.rel_to_song(root, song, sfz),
             "keyboard": keyboard,
             "plugin": "sfizz",
-            "instrument": INSTRUMENT_LABEL.get(keyboard, "钢琴"),
+            "instrument": _label_for_keyboard(keyboard, info),
             "role": INSTRUMENT_ROLE.get(keyboard, ""),
             "sampled": True,
             "key_range": info.get("key_range"),
@@ -329,22 +336,10 @@ def write_manifests(song, instruments):
             except Exception:
                 data = {}
         entry = data.setdefault(song, {})
-        existing = entry.get(key, []) or []
-        # Drop any previous entry for the same keyboard+instrument, and any stale
-        # sampler entry pointing at a file that no longer exists.
-        fresh_keys = {(e["keyboard"], e["instrument"]) for e in new_entries}
-        kept = []
-        for e in existing:
-            ident = (e.get("keyboard"), e.get("instrument"))
-            if ident in fresh_keys:
-                continue
-            rel = e.get("file") or e.get("sfz") or ""
-            if rel and not os.path.isfile(tone_paths.abs_from_song(root, song, rel)):
-                continue
-            kept.append(e)
-        entry[key] = kept + [dict(e, **({"sfz": e["file"]}
-                                         if fname == "sample-instruments.json"
-                                         else {})) for e in new_entries]
+        if fname == "manifest.json":
+            entry[key] = list(new_entries)
+        else:
+            entry[key] = [dict(e, sfz=e["file"]) for e in new_entries]
         entry["cantabile"] = entry.get("cantabile") or {}
         written[fname] = os.path.relpath(path, tc.WORKSPACE)
         with open(path, "w", encoding="utf-8") as f:
@@ -448,7 +443,8 @@ def _retune(y, ratio):
 
 
 def build_keyboard_sfz(keyboard, note_fn, song_slug, *, transpose=0,
-                       length_s=2.0, sr=SR, n_velocity=1):
+                       length_s=2.0, sr=SR, n_velocity=1,
+                       cutoff=12000, amp_veltrack=45):
     """Render every key of `keyboard` and write an sfizz SFZ + 16-bit samples.
 
     This is the production artifact Cantabile loads: one coherent sample per key
@@ -491,9 +487,9 @@ def build_keyboard_sfz(keyboard, note_fn, song_slug, *, transpose=0,
         f"// keyboard={keyboard} rendered keys={lo}..{hi} "
         f"regions cover {tc.SFZ_FULL_RANGE[0]}..{tc.SFZ_FULL_RANGE[1]}",
         "<global>",
-        "amp_veltrack=45",
+        f"amp_veltrack={int(amp_veltrack)}",
         "fil_type=lpf_2p",
-        "cutoff=12000",
+        f"cutoff={int(cutoff)}",
         "fil_veltrack=1800",
         "ampeg_attack=0.002",
         "ampeg_release=0.30",
@@ -587,7 +583,8 @@ def build_song_instruments(song, only=""):
             report["keyboards"][keyboard] = info
             continue
         note_fn = fn or piano_note_fn
-        info = build_keyboard_sfz(keyboard, note_fn, slug, transpose=tr)
+        kw = {"cutoff": 2800, "amp_veltrack": 35} if (keyboard == "左手" and kind == "piano") else {}
+        info = build_keyboard_sfz(keyboard, note_fn, slug, transpose=tr, **kw)
         info["voice"] = kind
         report["keyboards"][keyboard] = info
 
@@ -604,6 +601,25 @@ def build_song_instruments(song, only=""):
     return report
 
 
+def _apply_match_eq(y, sr, eq_db):
+    """Apply a smooth, unity-partitioned 3-band Match EQ (<250, 250-2000, >2000 Hz)."""
+    g1, g2, g3 = eq_db
+    if max(abs(g1), abs(g2), abs(g3)) < 0.05:
+        return y
+    y = np.asarray(y, dtype=np.float64)
+    n = len(y)
+    if n < 16:
+        return y
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    w1 = 1.0 / (1.0 + (freqs / 250.0) ** 4)
+    w3 = 1.0 / (1.0 + (2000.0 / np.maximum(freqs, 1.0)) ** 4)
+    w2 = np.maximum(0.0, 1.0 - w1 - w3)
+    gain_db = g1 * w1 + g2 * w2 + g3 * w3
+    gain = 10.0 ** (gain_db / 20.0)
+    spec = np.fft.rfft(y) * gain
+    return np.fft.irfft(spec, n=n)
+
+
 def _build_anchor_voice(stem_path, keyboard, slug):
     """Build a Golden-Anchor instrument for one keyboard from a stem.
 
@@ -615,26 +631,21 @@ def _build_anchor_voice(stem_path, keyboard, slug):
     import anchor_resynth as ar
 
     y, sr = tc.load_audio(stem_path, sr=SR, mono=True)
-    # Scan the WHOLE stem in overlapping windows, letting extract_anchors pool
-    # candidates across the song.
-    #
-    # MEASURED: handing it a single hand-picked 25 s window made every candidate
-    # come from the same passage, so the bass yielded 5 copies of one note (F2)
-    # and collapsed to a single anchor after de-duplication - which is what left
-    # the pedal keyboard unable to cover its range. extract_anchors already
-    # supports multi-window scanning; it just has to receive the full stem.
     anchors = ae.extract_anchors(y, sr, n_anchors=6)
     if not anchors:
         return None
     for a in anchors:
+        if keyboard == "脚":
+            a["tendency"] = "sustained"
         ar.prepare_anchor_fragment(a, y, sr)
 
-    n_anchors = len(anchors)
-    # Register transposition: the pedal plays an octave up from this song's bass
-    # register so it sits inside C1..C2 where the ELB-02 pedals actually are.
     transpose = OCTAVE_SHIFT_FOR_KEYBOARD.get(keyboard, 0)
+    if keyboard == "脚":
+        median_midi = float(np.median([a["midi"] for a in anchors]))
+        if median_midi < 26.0:
+            transpose = 12
 
-    # Render over the keyboard's *render* range, one nearest-anchor per key.
+    # Render over the keyboard's *render* range, blending the two nearest anchors.
     lo, hi = tc.render_range(keyboard)
     kb_dir = os.path.join(tc.WORKSPACE, "tone", slug,
                           tone_paths.ascii_keyboard(keyboard), "sfizz")
@@ -642,14 +653,6 @@ def _build_anchor_voice(stem_path, keyboard, slug):
     os.makedirs(sample_dir, exist_ok=True)
     samples = {}
     rendered = {}
-    # Interpolate BETWEEN anchors instead of switching at the nearest one.
-    #
-    # MEASURED: picking `min(anchors, key=|midi - target|)` per key made the note
-    # jump instantly from anchor A's timbre to anchor B's at the Voronoi boundary
-    # (left 66->67 measured 474% centroid/f0 jump, pedal 36->37 140%). A real
-    # instrument morphs continuously across a register, so each key crossfades
-    # the two nearest anchors in proportion to its position between them - which
-    # removes the discontinuity at its source rather than patching it afterwards.
     ordered = sorted(anchors, key=lambda a: a["midi"])
     for key in range(lo, hi + 1):
         target = key + transpose
@@ -658,10 +661,20 @@ def _build_anchor_voice(stem_path, keyboard, slug):
         rendered[key] = out / peak * tc.from_db(KEY_HEADROOM_DBFS)
 
     rendered, _worst = _coherence_pass(rendered, sr=sr)
+
+    # Compute and apply 3-band Match EQ against the source stem's LTAS.
+    source_ltas = np.asarray(tc.octave_band_ltas(y, sr), dtype=float)
+    synth_ltas = np.mean(
+        [tc.octave_band_ltas(rendered[k], sr) for k in sorted(rendered)], axis=0)
+    src_c = source_ltas - np.median(source_ltas)
+    syn_c = synth_ltas - np.median(synth_ltas)
+    eq = ar.fit_match_eq(src_c, syn_c, max_db=5.5)
+
     for key in list(rendered):
-        peak = np.abs(rendered[key]).max() + 1e-9
+        eqd = _apply_match_eq(rendered[key], sr, eq)
+        peak = np.abs(eqd).max() + 1e-9
         if peak > 0:
-            rendered[key] = rendered[key] / peak * tc.from_db(KEY_HEADROOM_DBFS)
+            rendered[key] = eqd / peak * tc.from_db(KEY_HEADROOM_DBFS)
 
     for key in range(lo, hi + 1):
         fname = f"k{key:03d}.wav"
@@ -670,35 +683,25 @@ def _build_anchor_voice(stem_path, keyboard, slug):
 
     sfz_path = os.path.join(kb_dir, f"{slug}.sfz")
     ar.build_sfz(sfz_path, {k: f"samples/tone/{v}" for k, v in samples.items()},
-                 keyboard=keyboard)
+                 eq=(0.0, 0.0, 0.0), keyboard=keyboard)
     size_mb = sum(os.path.getsize(os.path.join(sample_dir, f))
                   for f in os.listdir(sample_dir)) / (1024.0 * 1024.0)
     return {"sfz": sfz_path, "n_keys": len(samples), "key_range": [lo, hi],
             "voice": "anchor",
+            "eq_db": [round(float(x), 2) for x in eq],
             "anchors": [round(a["midi"], 1) for a in anchors],
             "samples_mb": round(size_mb, 2)}
 
 
-# How each non-Upper keyboard is transposed when voiced from a stem.
-#
-# MEASURED: the guitar anchors already span MIDI 42-62, i.e. the song's own
-# accompaniment register. Transposing the Lower keyboard down an octave pushed its
-# targets to 24-72, well outside that span, so most keys had to stretch one
-# anchor far beyond its recorded pitch - that is where the residual anchor-gap
-# timbre outliers came from. The stem is therefore rendered at its own register,
-# and the two hands are separated by using the piano's brightness for the Upper
-# (Stage-3 prior) rather than by shifting the Lower out of its sampled range.
-# The pedal still moves up an octave because the song's bass genuinely sits below
-# the ELB-02 pedalboard's lowest key.
-OCTAVE_SHIFT_FOR_KEYBOARD = {"左手": 0, "脚": 12}
+OCTAVE_SHIFT_FOR_KEYBOARD = {"左手": 0, "脚": 0}
 
 
 def _blend_anchors(anchors, target, sr=SR):
-    """Render `target` by crossfading the two nearest anchors.
+    """Render `target` by morphing the two nearest anchors in the STFT magnitude domain.
 
-    `anchors` must be sorted by midi. A key exactly on an anchor renders that
-    anchor alone; a key halfway between two anchors mixes them equally, so the
-    timbre changes continuously with pitch instead of switching at a boundary.
+    `anchors` must be sorted by midi. Magnitude-domain morphing avoids time-domain
+    phase cancellation / comb-filtering and guarantees smooth spectral centroid
+    interpolation across anchor gaps.
     """
     import anchor_resynth as ar
     if not anchors:
@@ -719,8 +722,10 @@ def _blend_anchors(anchors, target, sr=SR):
         return y_lo
     y_hi = ar.resynthesize_note(a_hi, target, sr=sr)
     n = min(len(y_lo), len(y_hi))
-    # Equal-power crossfade keeps loudness constant through the blend.
-    return np.cos(w * np.pi / 2) * y_lo[:n] + np.sin(w * np.pi / 2) * y_hi[:n]
+    S_lo, S_hi = tc.stft(y_lo[:n]), tc.stft(y_hi[:n])
+    mag = (1.0 - w) * np.abs(S_lo) + w * np.abs(S_hi)
+    phase = np.angle(S_lo) if w < 0.5 else np.angle(S_hi)
+    return tc.istft(mag * np.exp(1j * phase), length=n)
 
 
 def main():

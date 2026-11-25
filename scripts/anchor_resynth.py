@@ -75,20 +75,22 @@ def harmonic_comb_mask(y, sr, f0, cents=CFG["comb_cents"],
     """
     if f0 is None or f0 <= 0:
         return y
-    S = tc.stft(y)
+    n_fft = 8192
+    S = tc.stft(y, n_fft=n_fft)
     mag, phase = np.abs(S), np.angle(S)
     freqs = np.linspace(0, sr / 2, mag.shape[0])
     mask = np.zeros_like(mag)
+    bin_hz = sr / float(n_fft)
     k_max = int(min(max_harmonics, (sr / 2.0) / f0))
     for k in range(1, max(1, k_max) + 1):
         fk = f0 * k
         if fk >= sr / 2:
             break
-        tol = fk * (2 ** (cents / 1200.0) - 1.0)
+        tol = max(fk * (2.0 ** (cents / 1200.0) - 1.0), 0.6 * bin_hz)
         sel = np.abs(freqs - fk) <= tol
         mask[sel, :] = 1.0
     gain = mask + (1.0 - mask) * tc.from_db(-abs(attenuate_db))
-    out = tc.istft(mag * gain * np.exp(1j * phase), length=len(y))
+    out = tc.istft(mag * gain * np.exp(1j * phase), n_fft=n_fft, length=len(y))
     return out
 
 
@@ -220,6 +222,8 @@ def resynthesize_note(anchor, target_midi, sr=tc.SR, length_s=None, **_ignored):
     body = _periodic_loop(body, sr, f0_target, length_s)
 
     out = body * _amp_env(len(body), sr, tendency, anchor)
+    if tendency == "sustained":
+        out, _ = tc.phase_locked_loop(out, sr, f0_target)
 
     atk = anchor.get("_atk")
     if atk is not None and len(atk) > 16 and len(out) > len(atk):
