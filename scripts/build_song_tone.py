@@ -609,19 +609,25 @@ def build_song_instruments(song, only=""):
 
 
 def _apply_match_eq(y, sr, eq_db):
-    """Apply a smooth, unity-partitioned 3-band Match EQ (<250, 250-2000, >2000 Hz)."""
-    g1, g2, g3 = eq_db
-    if max(abs(g1), abs(g2), abs(g3)) < 0.05:
+    """Apply a smooth, unity-partitioned Match EQ (3-band or 8-octave-band)."""
+    eq_arr = np.asarray(eq_db, dtype=np.float64)
+    if eq_arr.size == 0 or np.max(np.abs(eq_arr)) < 0.05:
         return y
     y = np.asarray(y, dtype=np.float64)
     n = len(y)
     if n < 16:
         return y
     freqs = np.fft.rfftfreq(n, 1.0 / sr)
-    w1 = 1.0 / (1.0 + (freqs / 250.0) ** 4)
-    w3 = 1.0 / (1.0 + (2000.0 / np.maximum(freqs, 1.0)) ** 4)
-    w2 = np.maximum(0.0, 1.0 - w1 - w3)
-    gain_db = g1 * w1 + g2 * w2 + g3 * w3
+    if len(eq_arr) == len(tc.OCTAVE_BANDS_HZ):
+        log_f = np.log2(np.maximum(freqs, 20.0))
+        log_b = np.log2(np.asarray(tc.OCTAVE_BANDS_HZ, dtype=np.float64))
+        gain_db = np.interp(log_f, log_b, eq_arr)
+    else:
+        g1, g2, g3 = eq_arr[:3]
+        w1 = 1.0 / (1.0 + (freqs / 250.0) ** 4)
+        w3 = 1.0 / (1.0 + (2000.0 / np.maximum(freqs, 1.0)) ** 4)
+        w2 = np.maximum(0.0, 1.0 - w1 - w3)
+        gain_db = g1 * w1 + g2 * w2 + g3 * w3
     gain = 10.0 ** (gain_db / 20.0)
     spec = np.fft.rfft(y) * gain
     return np.fft.irfft(spec, n=n)
@@ -669,16 +675,17 @@ def _build_anchor_voice(stem_path, keyboard, slug):
 
     rendered, _worst = _coherence_pass(rendered, sr=sr)
 
-    # Compute and apply 3-band Match EQ against the source stem's LTAS.
+    # Compute and apply smooth octave-band Match EQ against the source stem's LTAS.
     source_ltas = np.asarray(tc.octave_band_ltas(y, sr), dtype=float)
     synth_ltas = np.mean(
         [tc.octave_band_ltas(rendered[k], sr) for k in sorted(rendered)], axis=0)
-    src_c = source_ltas - np.median(source_ltas)
-    syn_c = synth_ltas - np.median(synth_ltas)
+    src_c = source_ltas - np.median(source_ltas[1:5])
+    syn_c = synth_ltas - np.median(synth_ltas[1:5])
+    eq_oct = np.clip(src_c - syn_c, -5.5, 5.5)
     eq = ar.fit_match_eq(src_c, syn_c, max_db=5.5)
 
     for key in list(rendered):
-        eqd = _apply_match_eq(rendered[key], sr, eq)
+        eqd = _apply_match_eq(rendered[key], sr, eq_oct)
         peak = np.abs(eqd).max() + 1e-9
         if peak > 0:
             rendered[key] = eqd / peak * tc.from_db(KEY_HEADROOM_DBFS)
