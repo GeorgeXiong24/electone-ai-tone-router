@@ -297,7 +297,7 @@ def _label_for_keyboard(keyboard, info):
     return INSTRUMENT_LABEL.get(keyboard, "钢琴")
 
 
-def write_manifests(song, instruments):
+def write_manifests(song, instruments, partial=False):
     """Register the freshly built instruments in the tone manifests.
 
     Overwrites the song's `files` list in `manifest.json` cleanly with the
@@ -337,7 +337,14 @@ def write_manifests(song, instruments):
                 data = {}
         entry = data.setdefault(song, {})
         if fname == "manifest.json":
-            entry[key] = list(new_entries)
+            if partial:
+                by_kb = {e.get("keyboard"): e for e in (entry.get(key) or [])
+                         if e.get("plugin") == "sfizz"}
+                for e in new_entries:
+                    by_kb[e["keyboard"]] = e
+                entry[key] = list(by_kb.values())
+            else:
+                entry[key] = list(new_entries)
         else:
             entry[key] = [dict(e, sfz=e["file"]) for e in new_entries]
         entry["cantabile"] = entry.get("cantabile") or {}
@@ -591,7 +598,7 @@ def build_song_instruments(song, only=""):
     # THE FIX for "Cantabile keeps playing the old broken slices": register the
     # instruments we just wrote, or build-cantabile.py will never see them.
     try:
-        report["manifests"] = write_manifests(song, report)
+        report["manifests"] = write_manifests(song, report, partial=bool(want))
     except Exception as exc:      # noqa: BLE001
         report["manifests"] = {"error": str(exc)}
 

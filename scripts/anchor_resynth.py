@@ -134,15 +134,18 @@ def _periodic_loop(body, sr, f0_target, length_s):
         out = body[:max(take, need)]
         return out[:need]
 
-    # Short body: loop it. Snap the loop length to the nearest whole period so
-    # tiling preserves the fundamental (this is the fix).
-    n_periods = max(1, int(round(n / P)))
+    # Short body: loop a clean steady window (~60 ms) snapped to whole periods
+    # so tiling preserves the exact fundamental without dragging pitch drift /
+    # vibrato sidebands across the note.
+    target_periods = max(8, int(round(0.06 * sr / P)))
+    n_periods = min(max(1, int(n / P)), target_periods)
     unit_len = int(round(n_periods * P))
-    unit = body[:min(unit_len, n)]
+    start = min(max(0, n // 4), max(0, n - unit_len))
+    unit = body[start:min(start + unit_len, n)]
     if len(unit) < 16:
         unit = body
     # Equal-power crossfade at the seam so the join cannot click.
-    xf = min(int(0.010 * sr), len(unit) // 4)
+    xf = min(int(0.005 * sr), len(unit) // 4)
     if xf > 4:
         fade_in = np.sqrt(np.linspace(0, 1, xf))
         fade_out = np.sqrt(np.linspace(1, 0, xf))
